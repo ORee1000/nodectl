@@ -507,8 +507,8 @@ func findAgentAssetURL(repo, tag, prefix string) (string, error) {
 // getPanelReleaseTag 根据渠道使用面板版本号生成 GitHub Release Tag
 // 因为 Agent 二进制文件附在面板的 Release 中发布，所以 tag 必须是面板版本号
 // 工作流规则：
-//   - release-main.yml:  tag = version.Version（如 "v0.4.0"）
-//   - release-alpha.yml: tag = version.Version（如 "v0.4.0-alpha"，编译时已注入含 -alpha 的版本号）
+//   - release-main.yml:  tag = version.Version（如 "v0.4.1"）
+//   - release-alpha.yml: tag = version.Version（如 "v0.4.1-alpha"，编译时已注入含 -alpha 的版本号）
 func getPanelReleaseTag(channel string) string {
 	panelVer := version.Version
 
