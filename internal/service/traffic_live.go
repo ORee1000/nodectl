@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 
 	"nodectl/internal/database"
 	"nodectl/internal/logger"
+	"nodectl/internal/middleware"
 
 	"nhooyr.io/websocket"
 )
@@ -59,24 +61,9 @@ func hasRecentTrafficSignal(lastLiveAt, now time.Time) bool {
 //  通用辅助函数
 // ============================================================
 
-// getClientIP 从请求中提取真实客户端 IP（支持反向代理场景）
+// getClientIP 使用统一的可信代理规则解析客户端地址。
 func getClientIP(r *http.Request) string {
-	if ip := strings.TrimSpace(r.Header.Get("X-Real-IP")); ip != "" {
-		return ip
-	}
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if ip := strings.TrimSpace(strings.Split(xff, ",")[0]); ip != "" {
-			return ip
-		}
-	}
-	ip := r.RemoteAddr
-	if idx := strings.LastIndex(ip, ":"); idx != -1 {
-		if bracketIdx := strings.LastIndex(ip, "]"); bracketIdx != -1 {
-			return strings.Trim(ip[:bracketIdx+1], "[]")
-		}
-		return ip[:idx]
-	}
-	return ip
+	return middleware.ClientIP(r)
 }
 
 // ============================================================
@@ -97,19 +84,20 @@ type AgentTrafficMsg struct {
 
 // NodeLiveState 节点实时内存态
 type NodeLiveState struct {
-	InstallID     string    `json:"install_id"`
-	NodeUUID      string    `json:"node_uuid"`
-	RXRateBps     int64     `json:"rx_rate_bps"`
-	TXRateBps     int64     `json:"tx_rate_bps"`
-	LastLiveAt    time.Time `json:"last_live_at"`
-	AgentVersion  string    `json:"agent_version,omitempty"` // Agent 上报的版本号
-	TotalRXBytes  int64     `json:"total_rx_bytes"`
-	TotalTXBytes  int64     `json:"total_tx_bytes"`
-	LastCounterRX int64
-	LastCounterTX int64
-	CounterBootID string
-	CounterSeen   bool
-	Dirty         bool
+	InstallID       string    `json:"install_id"`
+	NodeUUID        string    `json:"node_uuid"`
+	RXRateBps       int64     `json:"rx_rate_bps"`
+	TXRateBps       int64     `json:"tx_rate_bps"`
+	LastLiveAt      time.Time `json:"last_live_at"`
+	AgentVersion    string    `json:"agent_version,omitempty"` // Agent 上报的版本号
+	TotalRXBytes    int64     `json:"total_rx_bytes"`
+	TotalTXBytes    int64     `json:"total_tx_bytes"`
+	LastCounterRX   int64
+	LastCounterTX   int64
+	CounterBootID   string
+	CounterSeen     bool
+	Dirty           bool
+	resetGeneration uint64
 }
 
 // FrontendPushMsg 推送给前端的实时消息
@@ -180,6 +168,7 @@ type TrafficHub struct {
 
 	// 命令结果回调通道：command_id → channel
 	cmdResults map[string]chan AgentCommandResult
+	cmdOwners  map[string]string
 	cmdMu      sync.Mutex
 
 	// 命令日志：command_id → CommandLog（供 SSE 流式推送）
@@ -190,6 +179,7 @@ type TrafficHub struct {
 // globalHub 全局单例（在 for 循环外持有生命周期）
 var globalHub *TrafficHub
 var hubOnce sync.Once
+var trafficPersistMu sync.Mutex
 
 // GetTrafficHub 返回全局 TrafficHub 单例
 func GetTrafficHub() *TrafficHub {
@@ -200,6 +190,7 @@ func GetTrafficHub() *TrafficHub {
 			subscribers: make(map[string]map[chan FrontendPushMsg]struct{}),
 			agentConns:  make(map[string]*websocket.Conn),
 			cmdResults:  make(map[string]chan AgentCommandResult),
+			cmdOwners:   make(map[string]string),
 			cmdLogs:     make(map[string]*CommandLog),
 		}
 		go globalHub.runTotalPersistLoop()
@@ -288,9 +279,10 @@ func (h *TrafficHub) runPointPersistLoop() {
 }
 
 type dirtyTrafficItem struct {
-	installID string
-	rx        int64
-	tx        int64
+	installID  string
+	rx         int64
+	tx         int64
+	generation uint64
 }
 
 func (h *TrafficHub) collectDirtyNodeTrafficAndClear() []dirtyTrafficItem {
@@ -301,7 +293,12 @@ func (h *TrafficHub) collectDirtyNodeTrafficAndClear() []dirtyTrafficItem {
 		if st == nil || !st.Dirty {
 			continue
 		}
-		items = append(items, dirtyTrafficItem{installID: iid, rx: st.TotalRXBytes, tx: st.TotalTXBytes})
+		items = append(items, dirtyTrafficItem{
+			installID:  iid,
+			rx:         st.TotalRXBytes,
+			tx:         st.TotalTXBytes,
+			generation: st.resetGeneration,
+		})
 		st.Dirty = false
 	}
 	h.mu.Unlock()
@@ -313,22 +310,33 @@ func (h *TrafficHub) flushDirtyNodeTrafficTotal() {
 	items := h.collectDirtyNodeTrafficAndClear()
 	now := time.Now()
 	for _, item := range items {
+		trafficPersistMu.Lock()
+		h.mu.RLock()
+		st := h.nodes[item.installID]
+		stale := st == nil || st.resetGeneration != item.generation
+		h.mu.RUnlock()
+		if stale {
+			trafficPersistMu.Unlock()
+			continue
+		}
 		if _, err := SaveNodeTrafficTotalOnly(item.installID, item.rx, item.tx, now); err != nil {
 			logger.Log.Error("实时累计流量写库失败", "install_id", item.installID, "error", err)
 			h.mu.Lock()
-			if st, ok := h.nodes[item.installID]; ok && st != nil {
+			if st, ok := h.nodes[item.installID]; ok && st != nil && st.resetGeneration == item.generation {
 				st.Dirty = true
 			}
 			h.mu.Unlock()
 		}
+		trafficPersistMu.Unlock()
 	}
 }
 
 func (h *TrafficHub) flushNodeTrafficPoint() {
 	type pointItem struct {
-		installID string
-		rx        int64
-		tx        int64
+		installID  string
+		rx         int64
+		tx         int64
+		generation uint64
 	}
 	items := make([]pointItem, 0, 64)
 
@@ -341,15 +349,30 @@ func (h *TrafficHub) flushNodeTrafficPoint() {
 		if !IsNodeOnline(iid) {
 			continue
 		}
-		items = append(items, pointItem{installID: iid, rx: st.TotalRXBytes, tx: st.TotalTXBytes})
+		items = append(items, pointItem{
+			installID:  iid,
+			rx:         st.TotalRXBytes,
+			tx:         st.TotalTXBytes,
+			generation: st.resetGeneration,
+		})
 	}
 	h.mu.RUnlock()
 
 	now := time.Now()
 	for _, item := range items {
+		trafficPersistMu.Lock()
+		h.mu.RLock()
+		st := h.nodes[item.installID]
+		stale := st == nil || st.resetGeneration != item.generation
+		h.mu.RUnlock()
+		if stale {
+			trafficPersistMu.Unlock()
+			continue
+		}
 		if _, err := SaveNodeTrafficPointOnly(item.installID, item.rx, item.tx, now); err != nil {
 			logger.Log.Error("实时流量点数据写库失败", "install_id", item.installID, "error", err)
 		}
+		trafficPersistMu.Unlock()
 	}
 }
 
@@ -436,7 +459,7 @@ func (h *TrafficHub) ensureNodeLiveState(installID string) {
 	}
 }
 
-func (h *TrafficHub) bindAgentConnection(conn *websocket.Conn, installID, clientIP string, agentInstallID *string) bool {
+func (h *TrafficHub) bindAgentConnection(conn *websocket.Conn, installID, agentToken, clientIP string, agentInstallID *string) bool {
 	installID = strings.TrimSpace(installID)
 	if installID == "" {
 		return false
@@ -457,10 +480,23 @@ func (h *TrafficHub) bindAgentConnection(conn *websocket.Conn, installID, client
 		return true
 	}
 
-	if !IsValidInstallID(installID) {
+	var node database.NodePool
+	if err := database.DB.Select("install_id", "agent_token").Where("install_id = ?", installID).First(&node).Error; err != nil {
 		logger.Log.Debug("Agent WS install_id 无效，连接已拒绝", "ip", clientIP, "install_id", installID)
 		_ = conn.Close(websocket.StatusPolicyViolation, "unknown node")
 		return false
+	}
+	expectedToken := strings.TrimSpace(node.AgentToken)
+	agentToken = strings.TrimSpace(agentToken)
+	if expectedToken != "" && (len(expectedToken) != len(agentToken) ||
+		subtle.ConstantTimeCompare([]byte(expectedToken), []byte(agentToken)) != 1) {
+		logger.Log.Warn("Agent WS 认证失败，连接已拒绝", "ip", clientIP, "install_id", installID)
+		_ = conn.Close(websocket.StatusPolicyViolation, "agent authentication failed")
+		return false
+	}
+	if expectedToken == "" {
+		logger.Log.Warn("旧版 Agent 使用无密钥兼容模式，请重新生成并执行安装脚本",
+			"ip", clientIP, "install_id", installID)
 	}
 
 	*agentInstallID = installID
@@ -522,8 +558,7 @@ func HandleAgentWS(w http.ResponseWriter, r *http.Request) {
 	clientIP := getClientIP(r)
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		Subprotocols:   []string{"nodectl-agent"},
-		OriginPatterns: []string{"*"},
+		Subprotocols: []string{"nodectl-agent"},
 	})
 	if err != nil {
 		logger.Log.Error("Agent WS 握手失败", "error", err, "ip", clientIP)
@@ -538,6 +573,12 @@ func HandleAgentWS(w http.ResponseWriter, r *http.Request) {
 
 	// 首个消息用于识别 install_id 并注册连接
 	var agentInstallID string
+	agentToken := strings.TrimSpace(r.Header.Get("X-Nodectl-Agent-Token"))
+	if headerInstallID := strings.TrimSpace(r.Header.Get("X-Nodectl-Install-ID")); headerInstallID != "" {
+		if !hub.bindAgentConnection(conn, headerInstallID, agentToken, clientIP, &agentInstallID) {
+			return
+		}
+	}
 
 	for {
 		readCtx, readCancel := context.WithTimeout(ctx, agentReadTimeout)
@@ -585,13 +626,25 @@ func HandleAgentWS(w http.ResponseWriter, r *http.Request) {
 
 		// 如果包含 type 字段且为命令结果类型，按命令结果处理
 		if peek.Type == "accepted" || peek.Type == "progress" || peek.Type == "result" {
+			if agentInstallID == "" {
+				logger.Log.Warn("未认证 Agent 尝试提交命令结果", "ip", clientIP, "type", peek.Type)
+				_ = conn.Close(websocket.StatusPolicyViolation, "authenticate before sending command results")
+				return
+			}
 			var cmdResult AgentCommandResult
-			json.Unmarshal(data, &cmdResult)
-
-			// 写入命令日志并通知 SSE 订阅者
-			hub.appendCommandLog(cmdResult)
+			if err := json.Unmarshal(data, &cmdResult); err != nil || strings.TrimSpace(cmdResult.CommandID) == "" {
+				logger.Log.Warn("Agent 命令结果格式无效", "ip", clientIP, "install_id", agentInstallID)
+				continue
+			}
 
 			hub.cmdMu.Lock()
+			owner, knownCommand := hub.cmdOwners[cmdResult.CommandID]
+			if !knownCommand || owner != agentInstallID {
+				hub.cmdMu.Unlock()
+				logger.Log.Warn("Agent 提交了不属于该节点的命令结果",
+					"ip", clientIP, "install_id", agentInstallID, "command_id", cmdResult.CommandID)
+				continue
+			}
 			if ch, exists := hub.cmdResults[cmdResult.CommandID]; exists {
 				select {
 				case ch <- cmdResult:
@@ -600,15 +653,20 @@ func HandleAgentWS(w http.ResponseWriter, r *http.Request) {
 				// result 类型表示执行完毕，清理通道
 				if cmdResult.Type == "result" {
 					delete(hub.cmdResults, cmdResult.CommandID)
+					delete(hub.cmdOwners, cmdResult.CommandID)
 				}
+			} else if cmdResult.Type == "result" {
+				delete(hub.cmdOwners, cmdResult.CommandID)
 			}
 			hub.cmdMu.Unlock()
+			// 仅记录已验证归属的命令结果。
+			hub.appendCommandLog(cmdResult)
 			continue
 		}
 
 		// 🆕 处理新增的消息类型（node_online / links_update）
 		if peek.Type == "node_online" || peek.Type == "links_update" || peek.Type == "protocol_change" {
-			hub.handleNewMessageType(data, peek.Type, clientIP, &agentInstallID, conn)
+			hub.handleNewMessageType(data, peek.Type, agentToken, clientIP, &agentInstallID, conn)
 			continue
 		}
 
@@ -625,7 +683,7 @@ func HandleAgentWS(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// 硬核校验：如果内存名单里根本没有这个节点（被删的孤儿），直接挂断不接客，并且不刷屏
-		if !hub.bindAgentConnection(conn, installID, clientIP, &agentInstallID) {
+		if !hub.bindAgentConnection(conn, installID, agentToken, clientIP, &agentInstallID) {
 			return
 		}
 
@@ -650,6 +708,7 @@ func HandleAgentWS(w http.ResponseWriter, r *http.Request) {
 		state.RXRateBps = msg.RXRateBps
 		state.TXRateBps = msg.TXRateBps
 		state.LastLiveAt = time.Now()
+		previousAgentVersion := state.AgentVersion
 		// 更新 agent 版本
 		if msg.AgentVersion != "" {
 			state.AgentVersion = msg.AgentVersion
@@ -696,8 +755,12 @@ func HandleAgentWS(w http.ResponseWriter, r *http.Request) {
 						"last_counter_rx", state.LastCounterRX,
 						"last_counter_tx", state.LastCounterTX,
 					)
-					deltaRX = 0
-					deltaTX = 0
+					if deltaRX < 0 {
+						deltaRX = 0
+					}
+					if deltaTX < 0 {
+						deltaTX = 0
+					}
 				}
 
 				// 单次增量合理性检测：单次增量超过 100GB 视为异常，跳过并告警
@@ -714,8 +777,12 @@ func HandleAgentWS(w http.ResponseWriter, r *http.Request) {
 						"last_counter_tx", state.LastCounterTX,
 						"boot_id", msg.BootID,
 					)
-					deltaRX = 0
-					deltaTX = 0
+					if deltaRX > maxSingleDelta {
+						deltaRX = 0
+					}
+					if deltaTX > maxSingleDelta {
+						deltaTX = 0
+					}
 				}
 
 				if deltaRX > 0 || deltaTX > 0 {
@@ -736,7 +803,7 @@ func HandleAgentWS(w http.ResponseWriter, r *http.Request) {
 		_ = CheckAndHandleNodeTrafficThresholdRealtime(installID, totalTX, totalRX)
 
 		// 持久化 agent_version 到 NodePool（仅版本变更时更新，避免重复写库）
-		if msg.AgentVersion != "" {
+		if msg.AgentVersion != "" && msg.AgentVersion != previousAgentVersion {
 			go func(iid, newVer string) {
 				var node database.NodePool
 				if err := database.DB.Select("name", "agent_version").Where("install_id = ?", iid).First(&node).Error; err != nil {
@@ -792,9 +859,7 @@ func HandleAgentWS(w http.ResponseWriter, r *http.Request) {
 func HandleTrafficLive(w http.ResponseWriter, r *http.Request) {
 	hub := GetTrafficHub()
 
-	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		OriginPatterns: []string{"*"},
-	})
+	conn, err := websocket.Accept(w, r, nil)
 	if err != nil {
 		logger.Log.Error("前端 Live WS 握手失败", "error", err, "ip", r.RemoteAddr)
 		return
@@ -1015,6 +1080,7 @@ func ResetNodeTrafficLiveState(installID string, nodeUUID string, resetAt time.T
 		st.RXRateBps = 0
 		st.TXRateBps = 0
 		st.Dirty = true
+		st.resetGeneration++
 
 		// Reset counter baseline and rebuild on next agent report.
 		st.CounterSeen = false
@@ -1077,12 +1143,14 @@ func DispatchCommandToNode(installID string, action string, payload interface{},
 	resultCh := make(chan AgentCommandResult, 8)
 	hub.cmdMu.Lock()
 	hub.cmdResults[commandID] = resultCh
+	hub.cmdOwners[commandID] = installID
 	hub.cmdMu.Unlock()
 
 	// 清理函数
 	defer func() {
 		hub.cmdMu.Lock()
 		delete(hub.cmdResults, commandID)
+		delete(hub.cmdOwners, commandID)
 		hub.cmdMu.Unlock()
 	}()
 
@@ -1211,15 +1279,24 @@ func FireCommandToNode(installID string, action string, payload interface{}) (st
 		subs:    make(map[chan CommandLogEntry]struct{}),
 	}
 	hub.logMu.Unlock()
+	hub.cmdMu.Lock()
+	hub.cmdOwners[commandID] = installID
+	hub.cmdMu.Unlock()
 
 	data, err := json.Marshal(cmd)
 	if err != nil {
+		hub.cmdMu.Lock()
+		delete(hub.cmdOwners, commandID)
+		hub.cmdMu.Unlock()
 		return "", fmt.Errorf("命令序列化失败: %w", err)
 	}
 
 	writeCtx, writeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer writeCancel()
 	if err := conn.Write(writeCtx, websocket.MessageText, data); err != nil {
+		hub.cmdMu.Lock()
+		delete(hub.cmdOwners, commandID)
+		hub.cmdMu.Unlock()
 		return "", fmt.Errorf("命令发送失败: %w", err)
 	}
 
@@ -1235,6 +1312,9 @@ func FireCommandToNode(installID string, action string, payload interface{}) (st
 		hub.logMu.Lock()
 		delete(hub.cmdLogs, commandID)
 		hub.logMu.Unlock()
+		hub.cmdMu.Lock()
+		delete(hub.cmdOwners, commandID)
+		hub.cmdMu.Unlock()
 	}()
 
 	return commandID, nil
@@ -1343,7 +1423,7 @@ type wsLinksUpdatePayload struct {
 }
 
 // handleNewMessageType 🆕 处理新增的 WebSocket 消息类型
-func (h *TrafficHub) handleNewMessageType(data []byte, msgType string, clientIP string, agentInstallID *string, conn *websocket.Conn) {
+func (h *TrafficHub) handleNewMessageType(data []byte, msgType, agentToken, clientIP string, agentInstallID *string, conn *websocket.Conn) {
 	var msg wsMessage
 	if err := json.Unmarshal(data, &msg); err != nil {
 		logger.Log.Warn("WS 新消息解析失败", "error", err, "type", msgType, "ip", clientIP)
@@ -1356,7 +1436,7 @@ func (h *TrafficHub) handleNewMessageType(data []byte, msgType string, clientIP 
 		return
 	}
 
-	if !h.bindAgentConnection(conn, installID, clientIP, agentInstallID) {
+	if !h.bindAgentConnection(conn, installID, agentToken, clientIP, agentInstallID) {
 		return
 	}
 

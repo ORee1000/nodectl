@@ -79,6 +79,12 @@ func apiAirportAdd(w http.ResponseWriter, r *http.Request) {
 		sendJSON(w, "error", "订阅链接不能为空")
 		return
 	}
+	req.URL = strings.TrimSpace(req.URL)
+	if err := service.ValidateSubscriptionURL(req.URL); err != nil {
+		logger.Log.Warn("添加机场订阅失败: URL 安全校验未通过", "error", err, "ip", clientIP, "path", reqPath)
+		sendJSON(w, "error", err.Error())
+		return
+	}
 
 	if req.Name == "" {
 		fetchedName := service.FetchSubscriptionName(req.URL)
@@ -145,7 +151,6 @@ func apiAirportUpdate(w http.ResponseWriter, r *http.Request) {
 		sendJSON(w, "error", "缺少订阅ID")
 		return
 	}
-
 	var sub database.AirportSub
 	if err := database.DB.Where("id = ?", req.ID).First(&sub).Error; err != nil {
 		logger.Log.Warn("更新机场订阅失败: 订阅不存在", "id", req.ID, "ip", clientIP, "path", reqPath)
@@ -318,6 +323,14 @@ func apiAirportEdit(w http.ResponseWriter, r *http.Request) {
 		logger.Log.Warn("编辑机场订阅失败: 缺少订阅ID", "ip", clientIP, "path", reqPath)
 		sendJSON(w, "error", "订阅ID不能为空")
 		return
+	}
+	req.URL = strings.TrimSpace(req.URL)
+	if req.URL != "" {
+		if err := service.ValidateSubscriptionURL(req.URL); err != nil {
+			logger.Log.Warn("编辑机场订阅失败: URL 安全校验未通过", "error", err, "ip", clientIP, "path", reqPath)
+			sendJSON(w, "error", err.Error())
+			return
+		}
 	}
 
 	var oldSub database.AirportSub

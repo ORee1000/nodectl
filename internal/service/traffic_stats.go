@@ -5,11 +5,18 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"nodectl/internal/database"
+	"nodectl/internal/logger"
 
 	"gorm.io/gorm"
+)
+
+var (
+	trafficCleanupMu      sync.Mutex
+	lastTrafficCleanupDay int
 )
 
 func isNodeTrafficStatsPrimaryKeyConflict(err error) bool {
@@ -79,11 +86,6 @@ func saveNodeTrafficPointOnce(installID string, rxBytes, txBytes int64, reported
 			return err
 		}
 
-		retentionDays := loadTrafficRetentionDays(tx)
-		if err := cleanupExpiredTrafficStats(tx, reportedAt, retentionDays); err != nil {
-			return err
-		}
-
 		return nil
 	})
 
@@ -94,6 +96,7 @@ func saveNodeTrafficPointOnce(installID string, rxBytes, txBytes int64, reported
 	// 事务成功后递增历史流量记录计数
 	if found && savedNodeUUID != "" {
 		IncrementTrafficHistoryCount(savedNodeUUID)
+		maybeCleanupExpiredTrafficStats(reportedAt)
 	}
 
 	return found, nil
@@ -229,7 +232,7 @@ func loadTrafficRetentionDays(tx *gorm.DB) int {
 	return normalizeTrafficRetentionDays(days)
 }
 
-func cleanupExpiredTrafficStats(tx *gorm.DB, now time.Time, retentionDays int) error {
+func cleanupExpiredTrafficStats(tx *gorm.DB, now time.Time, retentionDays int) (map[string]int64, error) {
 	cutoff := now.AddDate(0, 0, -normalizeTrafficRetentionDays(retentionDays))
 	cutoffDayKey := dayKey(cutoff)
 
@@ -239,27 +242,61 @@ func cleanupExpiredTrafficStats(tx *gorm.DB, now time.Time, retentionDays int) e
 		Cnt      int64  `gorm:"column:cnt"`
 	}
 	var counts []nodeDeleteCount
-	tx.Model(&database.NodeTrafficStat{}).
+	if err := tx.Model(&database.NodeTrafficStat{}).
 		Select("node_uuid, COUNT(*) as cnt").
 		Where("day_key < ?", cutoffDayKey).
 		Group("node_uuid").
-		Scan(&counts)
+		Scan(&counts).Error; err != nil {
+		return nil, err
+	}
 
 	// 执行删除
 	if err := tx.Where("day_key < ?", cutoffDayKey).Delete(&database.NodeTrafficStat{}).Error; err != nil {
-		return err
+		return nil, err
 	}
 
-	// 删除成功后，异步递减各节点的历史记录计数（不阻塞事务）
+	deletedByNode := make(map[string]int64, len(counts))
 	if len(counts) > 0 {
-		deletedByNode := make(map[string]int64, len(counts))
 		for _, c := range counts {
 			deletedByNode[c.NodeUUID] = c.Cnt
 		}
-		go BatchDecrementTrafficHistoryCountByCleanup(deletedByNode)
 	}
 
-	return nil
+	return deletedByNode, nil
+}
+
+// maybeCleanupExpiredTrafficStats runs retention cleanup at most once per local
+// day. Cleanup is committed before in-memory/history counters are adjusted.
+func maybeCleanupExpiredTrafficStats(now time.Time) {
+	today := dayKey(now)
+	trafficCleanupMu.Lock()
+	defer trafficCleanupMu.Unlock()
+	if today <= lastTrafficCleanupDay {
+		return
+	}
+
+	retentionDays := 30
+	if err := database.DB.Transaction(func(tx *gorm.DB) error {
+		retentionDays = loadTrafficRetentionDays(tx)
+		return nil
+	}); err != nil {
+		logger.Log.Warn("读取流量历史保留周期失败", "error", err)
+		return
+	}
+
+	var deletedByNode map[string]int64
+	if err := database.DB.Transaction(func(tx *gorm.DB) error {
+		var err error
+		deletedByNode, err = cleanupExpiredTrafficStats(tx, now, retentionDays)
+		return err
+	}); err != nil {
+		logger.Log.Warn("清理过期流量历史失败", "error", err)
+		return
+	}
+	lastTrafficCleanupDay = today
+	if len(deletedByNode) > 0 {
+		BatchDecrementTrafficHistoryCountByCleanup(deletedByNode)
+	}
 }
 
 // SaveNodeTrafficTotalOnly 仅更新 node_pool 累计流量，不写历史点数据。

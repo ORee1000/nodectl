@@ -17,11 +17,12 @@ const DefaultConfigPath = "/etc/nodectl-agent/config.json"
 // Config Agent 主配置结构体，从 /etc/nodectl-agent/config.json 读取
 type Config struct {
 	// 基础配置
-	InstallID string `json:"install_id"`          // 节点唯一标识 (12位)
-	PanelURL  string `json:"panel_url,omitempty"` // 🆕 面板地址（新版安装脚本使用，自动推导 ws_url）
-	WSURL     string `json:"ws_url,omitempty"`    // WebSocket 上报地址（旧版兼容 / 运行时计算）
-	Interface string `json:"interface"`           // 网卡名称 ("auto" 自动检测)
-	LogLevel  string `json:"log_level"`           // 日志等级
+	InstallID  string `json:"install_id"`            // 节点唯一标识 (12位)
+	AgentToken string `json:"agent_token,omitempty"` // Agent 与面板之间的独立认证密钥
+	PanelURL   string `json:"panel_url,omitempty"`   // 🆕 面板地址（新版安装脚本使用，自动推导 ws_url）
+	WSURL      string `json:"ws_url,omitempty"`      // WebSocket 上报地址（旧版兼容 / 运行时计算）
+	Interface  string `json:"interface"`             // 网卡名称 ("auto" 自动检测)
+	LogLevel   string `json:"log_level"`             // 日志等级
 
 	// 🆕 协议配置（首次启动时从后端拉取，或从缓存加载）
 	Protocols *singbox.ProtocolConfig `json:"protocols,omitempty"`
@@ -62,6 +63,9 @@ func LoadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("读取配置文件失败 [%s]: %w", path, err)
+	}
+	if err := os.Chmod(path, 0600); err != nil {
+		return nil, fmt.Errorf("收紧配置文件权限失败 [%s]: %w", path, err)
 	}
 
 	// 以默认值为基础，再覆盖 JSON 中的字段
@@ -250,7 +254,7 @@ func SaveConfig(path string, cfg *Config) error {
 		return fmt.Errorf("序列化配置失败: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := writeSecretFile(path, data); err != nil {
 		return fmt.Errorf("写入配置文件失败 [%s]: %w", path, err)
 	}
 

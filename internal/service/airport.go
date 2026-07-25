@@ -1,10 +1,12 @@
 package service
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -17,6 +19,91 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+const maxAirportSubscriptionBytes = 16 << 20
+
+func isBlockedSubscriptionIP(ip net.IP) bool {
+	return ip == nil || ip.IsUnspecified() || ip.IsLoopback() || ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast()
+}
+
+// ValidateSubscriptionURL rejects non-HTTP schemes and destinations that resolve
+// to local/private networks, preventing subscription-based SSRF.
+func ValidateSubscriptionURL(rawURL string) error {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return fmt.Errorf("订阅地址无效: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("订阅地址仅支持 http 或 https")
+	}
+	if u.Hostname() == "" || u.User != nil {
+		return fmt.Errorf("订阅地址主机无效")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, u.Hostname())
+	if err != nil {
+		return fmt.Errorf("解析订阅主机失败: %w", err)
+	}
+	if len(addrs) == 0 {
+		return fmt.Errorf("订阅主机没有可用地址")
+	}
+	for _, addr := range addrs {
+		if isBlockedSubscriptionIP(addr.IP) {
+			return fmt.Errorf("订阅地址不能指向本机或私有网络")
+		}
+	}
+	return nil
+}
+
+func newSubscriptionHTTPClient(timeout time.Duration) *http.Client {
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(address)
+			if err != nil {
+				return nil, err
+			}
+			ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+			if err != nil {
+				return nil, err
+			}
+			for _, ip := range ips {
+				if isBlockedSubscriptionIP(ip) {
+					continue
+				}
+				return dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+			}
+			return nil, fmt.Errorf("订阅主机没有可用的公网地址")
+		},
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+		IdleConnTimeout:       30 * time.Second,
+	}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return fmt.Errorf("订阅重定向次数过多")
+			}
+			return ValidateSubscriptionURL(req.URL.String())
+		},
+	}
+}
+
+func readLimitedSubscription(body io.Reader) ([]byte, error) {
+	limited := io.LimitReader(body, maxAirportSubscriptionBytes+1)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, fmt.Errorf("读取订阅内容失败: %w", err)
+	}
+	if len(data) > maxAirportSubscriptionBytes {
+		return nil, fmt.Errorf("订阅内容超过 %d MiB 限制", maxAirportSubscriptionBytes>>20)
+	}
+	return data, nil
+}
 
 // DeleteAirportSubscription 删除关联的节点和订阅本身，并清理可能存在于内存中的测试废土
 func DeleteAirportSubscription(subID string) error {
@@ -65,15 +152,20 @@ func SyncAirportSubscription(subID string) error {
 		}
 	}
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	if err := ValidateSubscriptionURL(sub.URL); err != nil {
+		return err
+	}
+	client := newSubscriptionHTTPClient(15 * time.Second)
 
 	// 1. 第一次请求：伪装成 Clash，专门骗取流量信息 Header
 	reqClash, err := http.NewRequest("GET", sub.URL, nil)
 	if err == nil {
 		reqClash.Header.Set("User-Agent", "Clash/1.18.0")
 		if respClash, err := client.Do(reqClash); err == nil {
-			parseTraffic(respClash.Header.Get("Subscription-Userinfo"))
-			respClash.Body.Close() // 只要 Header，直接丢弃容易解析失败的 YAML Body
+			if respClash.StatusCode >= 200 && respClash.StatusCode < 300 {
+				parseTraffic(respClash.Header.Get("Subscription-Userinfo"))
+			}
+			respClash.Body.Close()
 		}
 	}
 
@@ -89,13 +181,19 @@ func SyncAirportSubscription(subID string) error {
 		return err
 	}
 	defer respV2ray.Body.Close()
+	if respV2ray.StatusCode < 200 || respV2ray.StatusCode >= 300 {
+		return fmt.Errorf("订阅服务器返回 HTTP %d", respV2ray.StatusCode)
+	}
 
 	// 兜底机制：如果第一步 Clash 意外没拿到流量，尝试用本次 v2rayN 请求的 Header 补救
 	if sub.Total == 0 {
 		parseTraffic(respV2ray.Header.Get("Subscription-Userinfo"))
 	}
 
-	bodyBytes, _ := io.ReadAll(respV2ray.Body)
+	bodyBytes, err := readLimitedSubscription(respV2ray.Body)
+	if err != nil {
+		return err
+	}
 	content := string(bodyBytes)
 
 	// 2. 解析节点链接 (自动识别 Base64 或 Clash)
@@ -108,16 +206,18 @@ func SyncAirportSubscription(subID string) error {
 
 	if len(newLinks) == 0 {
 		logger.Log.Warn("订阅未解析到任何节点", "sub_name", sub.Name)
-		return nil
+		return fmt.Errorf("订阅未解析到任何有效节点")
 	}
 
-	// 3. 获取旧节点状态 (Name -> RoutingType 映射)
+	// 3. 使用节点链接作为稳定标识保存状态，避免重名节点互相覆盖。
 	var oldNodes []database.AirportNode
-	database.DB.Where("sub_id = ?", subID).Find(&oldNodes)
+	if err := database.DB.Where("sub_id = ?", subID).Find(&oldNodes).Error; err != nil {
+		return err
+	}
 	statusMap := make(map[string]int)
 	for _, node := range oldNodes {
 		if node.RoutingType != 0 {
-			statusMap[node.Name] = node.RoutingType
+			statusMap[node.Link] = node.RoutingType
 		}
 	}
 
@@ -130,6 +230,9 @@ func SyncAirportSubscription(subID string) error {
 	}
 
 	tx := database.DB.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
 
 	if err := tx.Where("sub_id = ?", subID).Delete(&database.AirportNode{}).Error; err != nil {
 		tx.Rollback()
@@ -147,7 +250,7 @@ func SyncAirportSubscription(subID string) error {
 		}
 
 		routingType := 0
-		if oldStatus, ok := statusMap[item.Name]; ok {
+		if oldStatus, ok := statusMap[item.Link]; ok {
 			routingType = oldStatus
 		}
 
@@ -183,7 +286,9 @@ func SyncAirportSubscription(subID string) error {
 	}
 
 	// 6. 提交事务 (这一步非常重要，不提交则上面的节点和流量都不会保存)
-	tx.Commit()
+	if err := tx.Commit().Error; err != nil {
+		return fmt.Errorf("提交订阅更新失败: %w", err)
+	}
 	return nil
 }
 
@@ -249,7 +354,10 @@ func isInvalidNode(name string, server string, port int) bool {
 
 // FetchSubscriptionName 尝试从订阅链接响应头获取名称
 func FetchSubscriptionName(subURL string) string {
-	client := &http.Client{Timeout: 8 * time.Second}
+	if err := ValidateSubscriptionURL(subURL); err != nil {
+		return ""
+	}
+	client := newSubscriptionHTTPClient(8 * time.Second)
 	req, err := http.NewRequest("GET", subURL, nil)
 	if err != nil {
 		return ""
@@ -260,12 +368,15 @@ func FetchSubscriptionName(subURL string) string {
 		return ""
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return ""
+	}
 
 	if title := resp.Header.Get("Profile-Title"); title != "" {
 		if decoded, err := url.QueryUnescape(title); err == nil {
-			return decoded
+			return sanitizeDisplayName(decoded)
 		}
-		return title
+		return sanitizeDisplayName(title)
 	}
 
 	cd := resp.Header.Get("Content-Disposition")
@@ -278,14 +389,14 @@ func FetchSubscriptionName(subURL string) string {
 					val = val[7:]
 				}
 				if decoded, err := url.PathUnescape(val); err == nil {
-					return strings.TrimSuffix(decoded, ".yaml")
+					return sanitizeDisplayName(strings.TrimSuffix(decoded, ".yaml"))
 				}
 			}
 		} else if strings.Contains(cd, "filename=") {
 			parts := strings.Split(cd, "filename=")
 			if len(parts) > 1 {
 				name := strings.Trim(strings.TrimSpace(parts[1]), `"; `)
-				return strings.TrimSuffix(name, ".yaml")
+				return sanitizeDisplayName(strings.TrimSuffix(name, ".yaml"))
 			}
 		}
 	}
@@ -295,7 +406,7 @@ func FetchSubscriptionName(subURL string) string {
 
 // cleanNodeName 清理节点名称，去除首尾和开头的无意义符号
 func cleanNodeName(name string) string {
-	name = strings.TrimSpace(name)
+	name = sanitizeDisplayName(name)
 	// 去除开头的无意义符号（横杠、下划线、竖线、星号等）以及它们附带的空格(含全角)
 	name = strings.TrimLeft(name, "-_|=+* \t　")
 	name = strings.TrimSpace(name)
@@ -303,6 +414,20 @@ func cleanNodeName(name string) string {
 		return "未命名节点"
 	}
 	return name
+}
+
+func sanitizeDisplayName(name string) string {
+	name = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, strings.TrimSpace(name))
+	runes := []rune(name)
+	if len(runes) > 200 {
+		name = string(runes[:200])
+	}
+	return strings.TrimSpace(name)
 }
 
 // ------------------- [解析与转换逻辑] -------------------

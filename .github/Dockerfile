@@ -1,22 +1,29 @@
-FROM alpine:latest
+FROM alpine:3.24.1
 
-# 安装基础证书和时区数据
-RUN apk --no-cache add ca-certificates tzdata
+RUN apk --no-cache add ca-certificates su-exec tzdata \
+    && addgroup -S -g 10001 nodectl \
+    && adduser -S -D -H -u 10001 -G nodectl -s /sbin/nologin nodectl \
+    && mkdir -p /app/data \
+    && chown -R nodectl:nodectl /app
 
-# 设定工作目录为 /app
 WORKDIR /app
 
-# 接收 Docker Buildx 传进来的目标架构 (amd64 或 arm64)
 ARG TARGETARCH
 
-# 将对应的二进制文件拷贝到 /app 目录下并直接赋予执行权限（减少镜像层数，加速构建）
 COPY --chmod=755 ./bin/nodectl-linux-${TARGETARCH} /app/nodectl
+COPY --chmod=755 ./.github/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-# 声明数据卷，提示用户挂载此目录
+ENV HOME=/app/data \
+    TZ=Asia/Shanghai
+
 VOLUME ["/app/data"]
-
-# 暴露 Web 端口
 EXPOSE 8080
 
-# 启动程序
-ENTRYPOINT ["/app/nodectl"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD wget -q -T 3 -O /dev/null http://127.0.0.1:8080/api/public/health \
+        || wget --no-check-certificate -q -T 3 -O /dev/null https://127.0.0.1:8080/api/public/health
+
+STOPSIGNAL SIGTERM
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["/app/nodectl"]

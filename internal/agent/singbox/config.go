@@ -457,12 +457,12 @@ func (cm *ConfigManager) GenerateAndSave() error {
 	}
 
 	if dir := filepath.Dir(cm.configPath); dir != "" {
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		if err := os.MkdirAll(dir, 0700); err != nil {
 			return fmt.Errorf("创建配置目录失败: %w", err)
 		}
 	}
 
-	if err := os.WriteFile(cm.configPath, data, 0644); err != nil {
+	if err := writeSecretFile(cm.configPath, data); err != nil {
 		return fmt.Errorf("写入 sing-box 配置文件失败: %w", err)
 	}
 
@@ -488,7 +488,7 @@ func (cm *ConfigManager) LoadFromCache() error {
 // SaveToCache 保存协议配置到缓存文件
 func (cm *ConfigManager) SaveToCache() error {
 	if dir := filepath.Dir(cm.protocolsPath); dir != "" {
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		if err := os.MkdirAll(dir, 0700); err != nil {
 			return fmt.Errorf("创建缓存目录失败: %w", err)
 		}
 	}
@@ -498,7 +498,7 @@ func (cm *ConfigManager) SaveToCache() error {
 		return fmt.Errorf("序列化协议配置失败: %w", err)
 	}
 
-	if err := os.WriteFile(cm.protocolsPath, data, 0644); err != nil {
+	if err := writeSecretFile(cm.protocolsPath, data); err != nil {
 		return fmt.Errorf("写入协议缓存失败: %w", err)
 	}
 

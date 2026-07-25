@@ -1826,6 +1826,7 @@
             const card = document.createElement('div');
             card.className = `air-sub-card ${isActive ? 'active' : ''}`;
             card.id = `sub-card-${sub.id}`;
+            const escapedSubName = escapeAirHtml(sub.name || '');
 
             // 计算流量进度 (兼容后端未返回相关字段的情况)
             let upload = sub.upload || 0;
@@ -1852,29 +1853,42 @@
             }
 
             card.innerHTML = `
-                <div class="air-sub-header-row" onclick="selectAirSub('${sub.id}')">
+                <div class="air-sub-header-row">
                     <div class="air-sub-name-wrap">
                         <div class="air-sub-name-header">
-                            <span class="air-sub-name">${sub.name}</span>
+                            <span class="air-sub-name">${escapedSubName}</span>
                             ${airState.runningTests[sub.id] ? `<span class="air-sub-testing-icon" title="测速中"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg></span>` : ''}
                             ${trafficInlineTxt}
                         </div>
                         ${trafficHtml}
                     </div>
                     <div class="air-sub-actions">
-                        <button class="air-mini-btn" title="编辑" onclick="startEdit('${sub.id}', '${sub.name}', '${sub.url}', event)" style="color: var(--air-primary);">
+                        <button class="air-mini-btn air-sub-edit" title="编辑" style="color: var(--air-primary);">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>
                         </button>
-                        <button class="air-mini-btn" title="更新" onclick="updateAirSub('${sub.id}', this, event)" style="color: var(--air-primary);">
+                        <button class="air-mini-btn air-sub-update" title="更新" style="color: var(--air-primary);">
                             <svg class="icon-refresh" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>
                         </button>
-                        <button class="air-mini-btn" title="删除" onclick="deleteAirSub('${sub.id}', this, event)" style="color: var(--air-danger);">
+                        <button class="air-mini-btn air-sub-delete" title="删除" style="color: var(--air-danger);">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
                         </button>
                     </div>
                 </div>
                 ${airState.isMobile ? `<div class="air-mobile-nodes-wrapper" id="mobile-nodes-${sub.id}"></div>` : ''}
             `;
+            card.querySelector('.air-sub-header-row').addEventListener('click', () => selectAirSub(sub.id));
+            card.querySelector('.air-sub-edit').addEventListener('click', event => {
+                event.stopPropagation();
+                startEdit(sub.id, sub.name || '', sub.url || '', event);
+            });
+            card.querySelector('.air-sub-update').addEventListener('click', event => {
+                event.stopPropagation();
+                updateAirSub(sub.id, event.currentTarget, event);
+            });
+            card.querySelector('.air-sub-delete').addEventListener('click', event => {
+                event.stopPropagation();
+                deleteAirSub(sub.id, event.currentTarget, event);
+            });
             listEl.appendChild(card);
         });
     }
@@ -1984,7 +1998,9 @@
         sorted.forEach(node => {
             const item = document.createElement('div');
             item.className = 'air-node-item';
-            const protoTag = node.protocol ? `<span class="air-proto-tag">${node.protocol}</span>` : '';
+            const escapedNodeName = escapeAirHtml(node.name || '');
+            const escapedProtocol = escapeAirHtml(node.protocol || '');
+            const protoTag = escapedProtocol ? `<span class="air-proto-tag">${escapedProtocol}</span>` : '';
 
             // 当前选中状态图标
             let activeIcon = node.routing_type === 1 ? '🔵 直连' : (node.routing_type === 2 ? '🟠 落地' : '⭕ 禁用');
@@ -2007,7 +2023,7 @@
 
             item.innerHTML = `
                 <div class="air-node-row" onclick="toggleNodeLink('${node.id}', event)">
-                    <div class="air-node-name">${protoTag}${node.name}</div>
+                    <div class="air-node-name">${protoTag}${escapedNodeName}</div>
                     <div class="air-node-actions">
                         <div class="air-speed-tags" id="speed-tags-${node.id}"></div>
 

@@ -2,7 +2,9 @@ package middleware
 
 import (
 	"fmt"
+	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,6 +35,8 @@ var (
 	loginRetryWindow  = time.Duration(defaultLoginRetryWindowSec) * time.Second
 	maxLoginRetries   = defaultMaxLoginRetries
 	loginBlockTTL     = time.Duration(defaultLoginBlockTTLSec) * time.Second
+	trustedProxyOnce  sync.Once
+	trustedProxyNets  []*net.IPNet
 )
 
 func sanitizeLoginLimitConfig(retryWindowSec, maxRetries, blockTTLSec int) (int, int, int) {
@@ -228,24 +232,102 @@ func compactUserAgent(ua string) string {
 	return ua
 }
 
-// getClientIP 从请求中提取真实客户端 IP（支持反向代理场景）
-func getClientIP(r *http.Request) string {
-	if ip := strings.TrimSpace(r.Header.Get("X-Real-IP")); ip != "" {
-		return ip
+func loadTrustedProxyNets() {
+	// 本机反向代理默认可信。Docker/外部代理需要通过
+	// NODECTL_TRUSTED_PROXIES 显式配置逗号分隔的 IP/CIDR。
+	raw := "127.0.0.0/8,::1/128"
+	if configured := strings.TrimSpace(os.Getenv("NODECTL_TRUSTED_PROXIES")); configured != "" {
+		raw += "," + configured
 	}
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if ip := strings.TrimSpace(strings.Split(xff, ",")[0]); ip != "" {
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if !strings.Contains(item, "/") {
+			if ip := net.ParseIP(item); ip != nil {
+				if ip.To4() != nil {
+					item += "/32"
+				} else {
+					item += "/128"
+				}
+			}
+		}
+		if _, network, err := net.ParseCIDR(item); err == nil {
+			trustedProxyNets = append(trustedProxyNets, network)
+		}
+	}
+}
+
+func requestPeerIP(r *http.Request) net.IP {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err != nil {
+		host = strings.Trim(strings.TrimSpace(r.RemoteAddr), "[]")
+	}
+	return net.ParseIP(host)
+}
+
+func isTrustedProxy(r *http.Request) bool {
+	trustedProxyOnce.Do(loadTrustedProxyNets)
+	ip := requestPeerIP(r)
+	for _, network := range trustedProxyNets {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// RequestIsHTTPS reports whether TLS terminates locally or at an explicitly
+// trusted reverse proxy.
+func RequestIsHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	if !isTrustedProxy(r) {
+		return false
+	}
+	proto := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0])
+	return strings.EqualFold(proto, "https")
+}
+
+// getClientIP 从请求中提取真实客户端 IP（仅信任已配置的反向代理）
+func getClientIP(r *http.Request) string {
+	if isTrustedProxy(r) {
+		if ip := strings.TrimSpace(r.Header.Get("X-Real-IP")); net.ParseIP(ip) != nil {
 			return ip
 		}
-	}
-	ip := r.RemoteAddr
-	if idx := strings.LastIndex(ip, ":"); idx != -1 {
-		if bracketIdx := strings.LastIndex(ip, "]"); bracketIdx != -1 {
-			return strings.Trim(ip[:bracketIdx+1], "[]")
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			if ip := strings.TrimSpace(strings.Split(xff, ",")[0]); net.ParseIP(ip) != nil {
+				return ip
+			}
 		}
-		return ip[:idx]
 	}
-	return ip
+	if ip := requestPeerIP(r); ip != nil {
+		return ip.String()
+	}
+	return strings.TrimSpace(r.RemoteAddr)
+}
+
+// ClientIP exposes the same trusted-proxy-aware resolution to other packages.
+func ClientIP(r *http.Request) string {
+	return getClientIP(r)
+}
+
+// SecurityHeaders applies headers that are compatible with the current
+// template-heavy UI. A strict CSP requires removing existing inline scripts and
+// is therefore handled separately.
+func SecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "same-origin")
+		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		if RequestIsHTTPS(r) {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Auth 鉴权中间件，用于保护需要登录才能访问的路由
@@ -317,6 +399,8 @@ func Auth(next http.HandlerFunc) http.HandlerFunc {
 				Path:     "/",
 				MaxAge:   -1,
 				HttpOnly: true,
+				Secure:   RequestIsHTTPS(r),
+				SameSite: http.SameSiteLaxMode,
 			})
 			http.Redirect(w, r, "/login", http.StatusFound)
 			return
@@ -327,12 +411,30 @@ func Auth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// ForceHTTPS 强制 HTTPS 重定向中间件 (已废弃网络层重定向)
-// 功能：在单端口热切换架构下，不再执行 HTTP 到 HTTPS 的强制跳转。
-// 真正的安全保护由 handlers.go 内部根据 sys_force_http 动态脱敏敏感数据来实现。
+func insecureHTTPExplicitlyAllowed() bool {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("NODECTL_ALLOW_INSECURE_HTTP")), "true") {
+		return true
+	}
+	if database.DB == nil {
+		return false
+	}
+	var cfg database.SysConfig
+	return database.DB.Select("value").Where("key = ?", "sys_force_http").Take(&cfg).Error == nil &&
+		strings.EqualFold(strings.TrimSpace(cfg.Value), "true")
+}
+
+// ForceHTTPS permits plain HTTP only on loopback or when the administrator has
+// explicitly enabled the insecure compatibility mode.
 func ForceHTTPS(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// 直接放行，保证用户在 HTTP 模式下也能打开后台面板上传证书
+		peerIP := requestPeerIP(r)
+		if !RequestIsHTTPS(r) && (peerIP == nil || !peerIP.IsLoopback()) && !insecureHTTPExplicitlyAllowed() {
+			w.Header().Set("Connection", "close")
+			http.Error(w,
+				"HTTPS is required. Use a local SSH tunnel for initial setup, configure TLS, or explicitly set NODECTL_ALLOW_INSECURE_HTTP=true.",
+				http.StatusUpgradeRequired)
+			return
+		}
 		next.ServeHTTP(w, r)
 	}
 }

@@ -1,0 +1,46 @@
+name: nodectl
+
+services:
+  nodectl:
+    image: ${NODECTL_IMAGE:-ghcr.io/oree1000/nodectl:latest}
+    container_name: nodectl
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:${NODECTL_PORT:-7878}:8080"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      NODECTL_ALLOW_INSECURE_HTTP: ${NODECTL_ALLOW_INSECURE_HTTP:-true}
+      NODECTL_TRUSTED_PROXIES: ${NODECTL_TRUSTED_PROXIES:-}
+    volumes:
+      - ${NODECTL_DATA_DIR:-./data}:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - KILL
+      - SETGID
+      - SETUID
+    pids_limit: 512
+    stop_grace_period: 20s
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          wget -q -T 3 -O /dev/null http://127.0.0.1:8080/api/public/health ||
+          wget --no-check-certificate -q -T 3 -O /dev/null https://127.0.0.1:8080/api/public/health
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

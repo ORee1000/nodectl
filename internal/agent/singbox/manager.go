@@ -43,8 +43,9 @@ type Manager struct {
 	pidPath    string
 
 	// 子进程
-	cmd    *exec.Cmd
-	cancel context.CancelFunc
+	cmd         *exec.Cmd
+	cancel      context.CancelFunc
+	processDone chan struct{}
 
 	// 状态
 	running    bool
@@ -187,8 +188,11 @@ func (m *Manager) startProcess(ctx context.Context) error {
 
 	log.Printf("[SingBox] sing-box 已启动 (PID=%d, config=%s)", m.pid, m.configPath)
 
-	// 启动监控协程
-	go m.watchProcess(ctx, cmd, logWriter)
+	// Wait 只能被调用一次。watchProcess 是唯一的 Wait 所有者，停止逻辑只等待
+	// processDone，避免 exec.Cmd 被重复 Wait。
+	processDone := make(chan struct{})
+	m.processDone = processDone
+	go m.watchProcess(procCtx, cmd, logWriter, processDone)
 
 	return nil
 }
@@ -210,36 +214,42 @@ func (m *Manager) stopProcess() error {
 		return nil
 	}
 
-	log.Printf("[SingBox] 正在停止 sing-box (PID=%d)...", m.pid)
+	cmd := m.cmd
+	done := m.processDone
+	pid := m.pid
+	log.Printf("[SingBox] 正在停止 sing-box (PID=%d)...", pid)
 
 	// 取消 context 触发进程终止
 	if m.cancel != nil {
 		m.cancel()
 	}
 
-	// 等待进程退出（最多 10 秒）
-	done := make(chan struct{})
-	go func() {
-		if m.cmd.Process != nil {
-			m.cmd.Wait()
-		}
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// 正常退出
-	case <-time.After(10 * time.Second):
-		// 超时强杀
-		if m.cmd.Process != nil {
-			log.Printf("[SingBox] sing-box 停止超时，强制终止 (PID=%d)", m.pid)
-			m.cmd.Process.Kill()
+	if done != nil {
+		select {
+		case <-done:
+			// watchProcess 已回收进程。
+		case <-time.After(10 * time.Second):
+			if cmd.Process != nil {
+				log.Printf("[SingBox] sing-box 停止超时，强制终止 (PID=%d)", pid)
+				_ = cmd.Process.Kill()
+			}
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				return fmt.Errorf("等待 sing-box 进程退出超时 (PID=%d)", pid)
+			}
 		}
 	}
 
-	m.running = false
-	m.cmd = nil
-	m.removePID()
+	// 仅清理本次停止的进程；旧 watcher 不得覆盖随后启动的新进程状态。
+	if m.cmd == cmd {
+		m.running = false
+		m.cmd = nil
+		m.cancel = nil
+		m.processDone = nil
+		m.pid = 0
+		m.removePID()
+	}
 
 	log.Printf("[SingBox] sing-box 已停止")
 	return nil
@@ -306,9 +316,10 @@ func (m *Manager) IsRunning() bool {
 // --- 内部方法 ---
 
 // watchProcess 监控 sing-box 子进程，异常退出时自动重启
-func (m *Manager) watchProcess(ctx context.Context, cmd *exec.Cmd, logWriter io.Writer) {
+func (m *Manager) watchProcess(ctx context.Context, cmd *exec.Cmd, logWriter io.Writer, done chan struct{}) {
 	// 等待进程退出
 	err := cmd.Wait()
+	close(done)
 
 	// 关闭日志文件
 	if closer, ok := logWriter.(io.Closer); ok {
@@ -316,14 +327,26 @@ func (m *Manager) watchProcess(ctx context.Context, cmd *exec.Cmd, logWriter io.
 	}
 
 	m.mu.Lock()
+	// 进程可能已被主动停止，并且 Manager 已经启动了新进程。旧 watcher
+	// 只能回收自己的资源，不能修改新进程的状态或 PID 文件。
+	if m.cmd != cmd {
+		m.mu.Unlock()
+		return
+	}
+
+	exitedPID := m.pid
 	m.running = false
+	m.cmd = nil
+	m.cancel = nil
+	m.processDone = nil
+	m.pid = 0
 	m.removePID()
 
 	if err != nil {
 		m.lastError = err.Error()
-		log.Printf("[SingBox] sing-box 异常退出 (PID=%d): %v", m.pid, err)
+		log.Printf("[SingBox] sing-box 异常退出 (PID=%d): %v", exitedPID, err)
 	} else {
-		log.Printf("[SingBox] sing-box 正常退出 (PID=%d)", m.pid)
+		log.Printf("[SingBox] sing-box 正常退出 (PID=%d)", exitedPID)
 	}
 
 	// 检查是否需要自动重启
@@ -423,6 +446,8 @@ func (m *Manager) ForceKill() {
 
 	// 1. 如果 Manager 正在管理一个进程，直接 SIGKILL
 	if m.running && m.cmd != nil && m.cmd.Process != nil {
+		cmd := m.cmd
+		done := m.processDone
 		pid := m.pid
 		log.Printf("[SingBox] ForceKill: 正在强制终止 sing-box (PID=%d)...", pid)
 
@@ -432,23 +457,25 @@ func (m *Manager) ForceKill() {
 		}
 
 		// 直接 SIGKILL，不等待优雅退出
-		m.cmd.Process.Kill()
+		_ = cmd.Process.Kill()
 
-		// 短暂等待进程退出，回收资源
-		done := make(chan struct{})
-		go func() {
-			m.cmd.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			// 2 秒内未退出也无妨，SIGKILL 一定会生效
+		// Wait 由 watcher 执行，这里只等待其完成。
+		if done != nil {
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				log.Printf("[SingBox] ForceKill: 等待进程退出超时 (PID=%d)", pid)
+			}
 		}
 
-		m.running = false
-		m.cmd = nil
-		m.removePID()
+		if m.cmd == cmd {
+			m.running = false
+			m.cmd = nil
+			m.cancel = nil
+			m.processDone = nil
+			m.pid = 0
+			m.removePID()
+		}
 		log.Printf("[SingBox] ForceKill: sing-box (PID=%d) 已被强制终止", pid)
 	}
 

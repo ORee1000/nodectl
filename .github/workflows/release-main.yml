@@ -18,11 +18,27 @@ permissions:
   packages: write
 
 jobs:
+  verify:
+    name: Verify Before Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          govulncheck ./...
+
   # ==========================================
   # 阶段 1: 交叉编译 Go 二进制文件并注入版本号
   # ==========================================
   build:
     name: Build Binaries
+    needs: verify
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -71,6 +87,7 @@ jobs:
   # ==========================================
   build-agent:
     name: Build Agent Binaries
+    needs: verify
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -181,12 +198,16 @@ jobs:
           echo "REPO_LC=${GITHUB_REPOSITORY,,}" >> ${GITHUB_ENV}
 
       - name: Build and Push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
-          context: . 
+          context: .
           file: .github/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
           tags: |
             ghcr.io/${{ env.REPO_LC }}:latest
             ghcr.io/${{ env.REPO_LC }}:${{ github.event.inputs.version }}

@@ -3,10 +3,12 @@ package database
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 
 	"nodectl/internal/logger"
 
 	"golang.org/x/crypto/bcrypt"
+	"gorm.io/gorm"
 )
 
 // SupportedProtocols 定义系统支持的节点协议列表 (全局变量，供前端和逻辑使用)
@@ -142,11 +144,11 @@ func initAuthSettings() {
 	// 2. 初始化默认管理员账号和密码
 	var adminUser SysConfig
 	if tx := DB.Select("key", "value").Where("key = ?", "admin_username").Limit(1).Find(&adminUser); tx.Error == nil && tx.RowsAffected == 0 {
-		// 生成 bcrypt 哈希密码 (默认密码设为 admin)
-		defaultPassword := "admin"
-		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(defaultPassword), bcrypt.DefaultCost)
+		// 每个新实例使用独立随机初始密码，避免公网部署被默认凭据接管。
+		initialPassword := generateInitialAdminPassword()
+		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(initialPassword), bcrypt.DefaultCost)
 		if err != nil {
-			panic("默认密码加密失败: " + err.Error())
+			panic("初始密码加密失败: " + err.Error())
 		}
 
 		// 存入用户名
@@ -154,8 +156,48 @@ func initAuthSettings() {
 		// 存入密码哈希值
 		DB.Create(&SysConfig{Key: "admin_password", Value: string(hashedPassword), Description: "管理员密码(Bcrypt加密)"})
 
-		logger.ConsoleAndLog.Warn("已创建默认管理员账号！", "用户名", "admin", "密码", "admin", "提示", "请登录后尽快修改！")
+		// 密码只输出到当前控制台，不写入持久化日志。
+		fmt.Printf("\n[SECURITY] NodeCTL 初始管理员账号：admin\n[SECURITY] 一次性初始密码：%s\n[SECURITY] 首次登录后请立即修改；该密码不会写入日志。\n\n", initialPassword)
+		logger.ConsoleAndLog.Warn("已创建随机初始管理员凭据，请查看当前启动控制台并在首次登录后立即修改")
 	}
+
+	// 升级旧实例时，如果凭据仍然是历史默认值 admin/admin，立即轮换密码
+	// 并重置 JWT，避免升级后继续暴露通用凭据。
+	var usernameCfg, passwordCfg SysConfig
+	userErr := DB.Select("key", "value").Where("key = ?", "admin_username").Take(&usernameCfg).Error
+	passErr := DB.Select("key", "value").Where("key = ?", "admin_password").Take(&passwordCfg).Error
+	if userErr == nil && passErr == nil && usernameCfg.Value == "admin" &&
+		bcrypt.CompareHashAndPassword([]byte(passwordCfg.Value), []byte("admin")) == nil {
+		initialPassword := generateInitialAdminPassword()
+		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(initialPassword), bcrypt.DefaultCost)
+		if err != nil {
+			panic("轮换历史默认密码失败: " + err.Error())
+		}
+		newJWTSecret := make([]byte, 32)
+		if _, err := rand.Read(newJWTSecret); err != nil {
+			panic("轮换 JWT 密钥失败: " + err.Error())
+		}
+		if err := DB.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Model(&SysConfig{}).Where("key = ?", "admin_password").
+				Update("value", string(hashedPassword)).Error; err != nil {
+				return err
+			}
+			return tx.Model(&SysConfig{}).Where("key = ?", "jwt_secret").
+				Update("value", hex.EncodeToString(newJWTSecret)).Error
+		}); err != nil {
+			panic("持久化轮换后的管理员凭据失败: " + err.Error())
+		}
+		fmt.Printf("\n[SECURITY] 检测到历史默认密码 admin/admin，已自动禁用。\n[SECURITY] 新的一次性管理员密码：%s\n[SECURITY] 登录后请立即修改；该密码不会写入日志。\n\n", initialPassword)
+		logger.ConsoleAndLog.Warn("检测到并轮换了历史默认管理员密码，所有旧会话已失效")
+	}
+}
+
+func generateInitialAdminPassword() string {
+	passwordBytes := make([]byte, 12)
+	if _, err := rand.Read(passwordBytes); err != nil {
+		panic("生成初始管理员密码失败: " + err.Error())
+	}
+	return hex.EncodeToString(passwordBytes)
 }
 
 func initProxySettings() {

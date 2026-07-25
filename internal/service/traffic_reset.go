@@ -56,11 +56,18 @@ func ParseTrafficResetAnchorDate(raw string) (*time.Time, error) {
 }
 
 func dayStartLocal(t time.Time) time.Time {
+	return dayStartInLocation(t, time.Local)
+}
+
+func dayStartInLocation(t time.Time, loc *time.Location) time.Time {
 	if t.IsZero() {
 		return t
 	}
-	y, m, d := t.In(time.Local).Date()
-	return time.Date(y, m, d, 0, 0, 0, 0, time.Local)
+	if loc == nil {
+		loc = time.Local
+	}
+	y, m, d := t.In(loc).Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, loc)
 }
 
 // ResolveTrafficResetAnchor resolves interval reset anchor in local date.
@@ -230,7 +237,11 @@ func shouldResetNodeTrafficNow(mode string, resetDay int, intervalDays int, last
 	if now.IsZero() {
 		now = time.Now()
 	}
-	now = now.In(time.Local)
+	// Preserve an explicitly supplied timezone. Production callers pass
+	// time.Now() (whose location is time.Local), while tests and reusable callers
+	// can safely evaluate a different timezone without mutating global state.
+	loc := now.Location()
+	now = now.In(loc)
 
 	switch mode {
 	case TrafficResetModeCalendarMonth:
@@ -253,15 +264,23 @@ func shouldResetNodeTrafficNow(mode string, resetDay int, intervalDays int, last
 	case TrafficResetModeIntervalDays:
 		intervalDays = NormalizeTrafficResetIntervalDays(intervalDays)
 
-		anchor := ResolveTrafficResetAnchor(anchorAt, createdAt, now)
+		var anchor time.Time
+		switch {
+		case anchorAt != nil && !anchorAt.IsZero():
+			anchor = dayStartInLocation(*anchorAt, loc)
+		case !createdAt.IsZero():
+			anchor = dayStartInLocation(createdAt, loc)
+		default:
+			anchor = dayStartInLocation(now, loc)
+		}
 
-		currCycle := intervalCycleIndex(anchor, dayStartLocal(now), intervalDays)
+		currCycle := intervalCycleIndex(anchor, dayStartInLocation(now, loc), intervalDays)
 		if currCycle < 1 {
 			return false
 		}
 		lastCycle := -1
 		if lastResetAt != nil && !lastResetAt.IsZero() {
-			lastCycle = intervalCycleIndex(anchor, dayStartLocal(*lastResetAt), intervalDays)
+			lastCycle = intervalCycleIndex(anchor, dayStartInLocation(*lastResetAt, loc), intervalDays)
 		}
 		return currCycle > lastCycle
 	default:
@@ -289,7 +308,7 @@ func localDateDiffDays(start, end time.Time) int {
 }
 
 func localDateSerial(t time.Time) int {
-	y, m, d := t.In(time.Local).Date()
+	y, m, d := t.Date()
 	// Use UTC midnight serial to avoid DST-related 23h/25h day skew.
 	return int(time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Unix() / 86400)
 }
@@ -324,6 +343,8 @@ func resetNodeTrafficCycle(node *database.NodePool, mode string, resetDay int, i
 		now = time.Now()
 	}
 	now = now.In(time.Local)
+	trafficPersistMu.Lock()
+	defer trafficPersistMu.Unlock()
 
 	if err := database.DB.Model(&database.NodePool{}).
 		Where("uuid = ?", node.UUID).

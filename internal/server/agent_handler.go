@@ -4,6 +4,9 @@
 package server
 
 import (
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,9 +17,46 @@ import (
 
 	"nodectl/internal/database"
 	"nodectl/internal/logger"
+	"nodectl/internal/middleware"
 	"nodectl/internal/service"
 	"nodectl/internal/version"
 )
+
+const agentTokenHeader = "X-Nodectl-Agent-Token"
+
+func agentTokenMatches(expected, provided string) bool {
+	expected = strings.TrimSpace(expected)
+	provided = strings.TrimSpace(provided)
+	return expected != "" && len(expected) == len(provided) &&
+		subtle.ConstantTimeCompare([]byte(expected), []byte(provided)) == 1
+}
+
+func ensureAgentToken(node *database.NodePool) (string, error) {
+	if node == nil {
+		return "", fmt.Errorf("node is nil")
+	}
+	if token := strings.TrimSpace(node.AgentToken); token != "" {
+		return token, nil
+	}
+
+	randomBytes := make([]byte, 24)
+	if _, err := rand.Read(randomBytes); err != nil {
+		return "", fmt.Errorf("生成 Agent 密钥失败: %w", err)
+	}
+	candidate := hex.EncodeToString(randomBytes)
+	if err := database.DB.Model(&database.NodePool{}).
+		Where("uuid = ? AND (agent_token = '' OR agent_token IS NULL)", node.UUID).
+		Update("agent_token", candidate).Error; err != nil {
+		return "", err
+	}
+	if err := database.DB.Select("agent_token").Where("uuid = ?", node.UUID).First(node).Error; err != nil {
+		return "", err
+	}
+	if node.AgentToken == "" {
+		return "", fmt.Errorf("Agent 密钥持久化失败")
+	}
+	return node.AgentToken, nil
+}
 
 // ============================================================
 //  5.1 Agent 初始化配置 API
@@ -38,6 +78,13 @@ func apiAgentInitConfig(w http.ResponseWriter, r *http.Request) {
 	if err := database.DB.Where("install_id = ?", installID).First(&node).Error; err != nil {
 		logger.Log.Warn("Agent init-config: 无效的 install_id", "install_id", installID, "ip", getClientIP(r))
 		sendJSON(w, "error", "node not found")
+		return
+	}
+	// 已启用密钥的节点必须认证。AgentToken 为空只用于旧版节点的迁移期；
+	// 管理员重新生成并运行安装脚本后会自动升级到强认证。
+	if node.AgentToken != "" && !agentTokenMatches(node.AgentToken, r.Header.Get(agentTokenHeader)) {
+		logger.Log.Warn("Agent init-config: 认证失败", "install_id", installID, "ip", getClientIP(r))
+		http.Error(w, "agent authentication failed", http.StatusUnauthorized)
 		return
 	}
 
@@ -135,7 +182,7 @@ func apiDownloadAgent(w http.ResponseWriter, r *http.Request) {
 	// 获取 GitHub 仓库信息
 	githubRepo := loadSysConfigValue("github_repo")
 	if githubRepo == "" {
-		githubRepo = "hobin66/nodectl" // 默认仓库
+		githubRepo = "ORee1000/nodectl" // 默认仓库
 	}
 
 	// 构造 Release Tag（使用面板版本号，因为 Agent 二进制附在面板的 Release 中）
@@ -183,17 +230,23 @@ func apiNewInstallScript(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid InstallID", http.StatusForbidden)
 		return
 	}
+	agentToken, err := ensureAgentToken(&node)
+	if err != nil {
+		logger.Log.Error("生成 Agent 安装密钥失败", "id", installID, "error", err)
+		http.Error(w, "Failed to provision agent credentials", http.StatusInternalServerError)
+		return
+	}
 
 	// 获取面板 URL
 	panelURL := loadSysConfigValue("panel_url")
-	isSecure := r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+	isSecure := middleware.RequestIsHTTPS(r)
 	panelURL = getPanelURLForScript(panelURL, r.Host, isSecure)
 
 	// 读取 BBR 优化开关
 	enableBBR := loadSysConfigValue("proxy_enable_bbr") == "true"
 
 	// 生成新版极简安装脚本
-	script := generateMinimalInstallScript(installID, panelURL, enableBBR)
+	script := generateMinimalInstallScript(installID, agentToken, panelURL, enableBBR)
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Write([]byte(script))
@@ -380,7 +433,7 @@ var agentAssetCache = struct {
 
 // findAgentAssetURL 通过 GitHub API 查找指定 Release 中匹配前缀的 agent 二进制下载 URL
 // 参数：
-//   - repo: GitHub 仓库（如 "hobin66/nodectl"）
+//   - repo: GitHub 仓库（如 "ORee1000/nodectl"）
 //   - tag:  Release tag（如 "v0.4.32-alpha"）
 //   - prefix: 文件名前缀（如 "nodectl-agent-linux-amd64-"）
 //

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand/v2"
+	"net/http"
 	"sync"
 	"time"
 
@@ -107,8 +108,14 @@ func (r *Reporter) Connect(ctx context.Context) error {
 	dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
+	headers := make(http.Header)
+	headers.Set("X-Nodectl-Install-ID", r.cfg.InstallID)
+	if r.cfg.AgentToken != "" {
+		headers.Set("X-Nodectl-Agent-Token", r.cfg.AgentToken)
+	}
 	conn, _, err := websocket.Dial(dialCtx, r.cfg.WSURL, &websocket.DialOptions{
 		Subprotocols: []string{"nodectl-agent"},
+		HTTPHeader:   headers,
 	})
 	if err != nil {
 		r.connected = false

@@ -120,7 +120,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 			Value:    tokenString,
 			Path:     "/",
 			HttpOnly: true,
-			Secure:   false,
+			Secure:   middleware.RequestIsHTTPS(r),
 			MaxAge:   maxAge,
 			Expires:  expireAt,
 			SameSite: http.SameSiteLaxMode,
@@ -242,6 +242,8 @@ func logoutHandler(w http.ResponseWriter, r *http.Request) {
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   middleware.RequestIsHTTPS(r),
+		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 		Expires:  time.Now().Add(-1 * time.Hour),
 	})
@@ -397,6 +399,8 @@ func apiChangePassword(w http.ResponseWriter, r *http.Request) {
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   middleware.RequestIsHTTPS(r),
+		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
 
@@ -437,6 +441,8 @@ func apiResetJWT(w http.ResponseWriter, r *http.Request) {
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   middleware.RequestIsHTTPS(r),
+		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
 

@@ -1,7 +1,7 @@
 #!/bin/sh
 # NodeCTL 一键安装脚本
-# 项目地址: https://github.com/hobin66/nodectl
-# 用法: bash <(curl -fsSL https://raw.githubusercontent.com/hobin66/nodectl/main/install.sh)
+# 项目地址: https://github.com/ORee1000/nodectl
+# 用法: bash <(curl -fsSL https://raw.githubusercontent.com/ORee1000/nodectl/main/install.sh)
 
 set -e
 
@@ -19,7 +19,7 @@ warn()  { printf "${YELLOW}[WARN]${NC} %s\n" "$*"; }
 err()   { printf "${RED}[ERR]${NC} %s\n" "$*" >&2; }
 
 # ========== 常量 ==========
-GITHUB_REPO="hobin66/nodectl"
+GITHUB_REPO="ORee1000/nodectl"
 INSTALL_DIR="/opt/nodectl"
 DATA_DIR="${INSTALL_DIR}/data"
 BIN_PATH="${INSTALL_DIR}/nodectl"
@@ -31,7 +31,7 @@ DEFAULT_PORT=8080
 check_root() {
     if [ "$(id -u)" != "0" ]; then
         err "此脚本需要 root 权限运行"
-        err "请使用: sudo bash <(curl -fsSL https://raw.githubusercontent.com/hobin66/nodectl/main/install.sh)"
+        err "请使用: sudo bash <(curl -fsSL https://raw.githubusercontent.com/ORee1000/nodectl/main/install.sh)"
         exit 1
     fi
 }
@@ -346,7 +346,7 @@ install_nt_command() {
     cat > "${NT_BIN}" <<'NTEOF'
 #!/bin/sh
 # NodeCTL 管理工具 (nt)
-# 项目地址: https://github.com/hobin66/nodectl
+# 项目地址: https://github.com/ORee1000/nodectl
 # 用法: nt [命令]  或直接运行 nt 进入交互式菜单
 # 兼容: Alpine (OpenRC) / Debian (systemd)
 
@@ -366,7 +366,7 @@ warn()  { printf "${YELLOW}[WARN]${NC} %s\n" "$*"; }
 err()   { printf "${RED}[ERR]${NC} %s\n" "$*" >&2; }
 
 # ========== 常量 ==========
-GITHUB_REPO="hobin66/nodectl"
+GITHUB_REPO="ORee1000/nodectl"
 INSTALL_DIR="/opt/nodectl"
 DATA_DIR="${INSTALL_DIR}/data"
 BIN_PATH="${INSTALL_DIR}/nodectl"
@@ -961,7 +961,7 @@ main() {
     start_service
 
     # 完成提示
-    local access_url="http://你的IP:${WEB_PORT}"
+    local access_url="http://127.0.0.1:${WEB_PORT}"
     echo ""
     printf "${GREEN}╔══════════════════════════════════════╗${NC}\n"
     printf "${GREEN}║     NodeCTL 安装完成！               ║${NC}\n"
@@ -973,7 +973,7 @@ main() {
     printf "${GREEN}║  端口: %-31s║${NC}\n" "${WEB_PORT}"
     printf "${GREEN}║                                      ║${NC}\n"
     printf "${GREEN}║  访问: %-31s║${NC}\n" "${access_url}"
-    printf "${GREEN}║  账号: admin / admin                 ║${NC}\n"
+    printf "${GREEN}║  账号: admin / 随机初始密码          ║${NC}\n"
     printf "${GREEN}║                                      ║${NC}\n"
     printf "${GREEN}║  管理命令: nt                         ║${NC}\n"
     printf "${GREEN}║                                      ║${NC}\n"
@@ -987,6 +987,9 @@ main() {
     info "  nt update    更新版本"
     info "  nt uninstall 卸载 NodeCTL"
     info "  nt help      查看帮助"
+    info "初始密码仅输出到首次启动控制台，可运行以下命令查看本次启动日志:"
+    info "  journalctl -u nodectl -n 80 --no-pager"
+    info "未配置 HTTPS 前，请通过 SSH 端口转发访问本机地址，勿将 HTTP 端口暴露到公网。"
     echo ""
 }
 

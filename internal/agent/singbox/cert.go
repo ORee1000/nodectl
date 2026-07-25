@@ -99,6 +99,10 @@ func GenerateSelfSignedCert(certPath, keyPath, commonName string) error {
 		return fmt.Errorf("创建私钥文件失败: %w", err)
 	}
 	defer keyOut.Close()
+	// OpenFile 的 perm 不会收紧已存在文件的权限。
+	if err := keyOut.Chmod(0600); err != nil {
+		return fmt.Errorf("设置私钥文件权限失败: %w", err)
+	}
 
 	if err := pem.Encode(keyOut, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes}); err != nil {
 		return fmt.Errorf("写入私钥 PEM 失败: %w", err)

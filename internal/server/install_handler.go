@@ -13,7 +13,7 @@ import (
 // 负责：检测系统环境 → 安装依赖 → 下载 agent → 写配置 → 注册系统服务 → 注册 na 快捷命令
 // 支持 Debian/Ubuntu、CentOS/RHEL/Fedora、Alpine Linux 三大系统族
 // 所有复杂逻辑（sing-box 安装、配置生成、证书管理）内置于 Agent 二进制中
-func generateMinimalInstallScript(installID, panelURL string, enableBBR bool) string {
+func generateMinimalInstallScript(installID, agentToken, panelURL string, enableBBR bool) string {
 	// 获取当前面板的发布渠道（仅用于下载阶段，确保下载与面板版本匹配的 Agent）
 	channel := string(version.GetChannel())
 
@@ -32,6 +32,7 @@ set -euo pipefail
 
 # ========== 面板生成时自动填充 ==========
 INSTALL_ID="%s"
+AGENT_TOKEN="%s"
 PANEL_URL="%s"
 CHANNEL="%s"
 ENABLE_BBR="%s"
@@ -391,7 +392,7 @@ main() {
     chmod +x "$AGENT_BIN"
 
     # 3. 创建必要目录
-    mkdir -p "$CONFIG_DIR"
+    install -d -m 0700 "$CONFIG_DIR"
     mkdir -p "$DATA_DIR"
 
     # 4. 生成最小化配置
@@ -401,11 +402,13 @@ main() {
     cat > "${CONFIG_DIR}/config.json" <<EOF
 {
   "install_id": "$INSTALL_ID",
+  "agent_token": "$AGENT_TOKEN",
   "panel_url": "$CALLBACK_URL",
   "interface": "auto",
   "log_level": "info"
 }
 EOF
+    chmod 0600 "${CONFIG_DIR}/config.json"
 
     info "配置文件已写入: ${CONFIG_DIR}/config.json"
     if [ -n "$REPORT_URL" ]; then
@@ -485,7 +488,7 @@ SVCEOF
 }
 
 main
-`, installID, panelURL, channel, bbrFlag)
+`, installID, agentToken, panelURL, channel, bbrFlag)
 }
 
 // getPanelURLForScript 获取面板 URL 用于安装脚本生成

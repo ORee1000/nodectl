@@ -259,6 +259,8 @@ func Start(tmplFS embed.FS) {
 	// 3. 创建路由器并注册所有路由 (只需执行一次，避免重复注册引发 panic)
 	mux := http.NewServeMux()
 
+	mux.HandleFunc("/api/public/health", withSecure(apiHealth)) // 容器编排健康检查
+
 	// ========== A. 页面路由 (Page Routes) ==========
 	mux.HandleFunc("/login", withSecure(loginHandler))   // 登录页
 	mux.HandleFunc("/", withAuthAndSecure(indexHandler)) // 首页
@@ -318,10 +320,10 @@ func Start(tmplFS embed.FS) {
 	mux.HandleFunc("/api/db/vacuum", withAuthAndSecure(apiVacuumDatabase))
 
 	// ========== C. 公开/工具 路由 ==========
-	mux.HandleFunc("/api/public/new-install-script", withSecure(apiNewInstallScript)) // 🆕 新版极简安装脚本
-	mux.HandleFunc("/api/public/download/agent", apiDownloadAgent)                    // 🆕 Agent 二进制下载302中转层，强制匹配面板和agent版本
-	mux.HandleFunc("/api/agent/init-config", withSecure(apiAgentInitConfig))          // 🆕 Agent 初始化配置
-	mux.HandleFunc("/api/callback/traffic/ws", apiCallbackTrafficWS)                  // Agent WS 统一上报通道
+	mux.HandleFunc("/api/public/new-install-script", withAuthAndSecure(apiNewInstallScript)) // 安装脚本含节点密钥，必须管理员登录
+	mux.HandleFunc("/api/public/download/agent", apiDownloadAgent)                           // 🆕 Agent 二进制下载302中转层，强制匹配面板和agent版本
+	mux.HandleFunc("/api/agent/init-config", withSecure(apiAgentInitConfig))                 // 🆕 Agent 初始化配置
+	mux.HandleFunc("/api/callback/traffic/ws", apiCallbackTrafficWS)                         // Agent WS 统一上报通道
 	// 实时流量订阅 (前端 WebSocket)
 	mux.HandleFunc("/api/traffic/live", withAuthAndSecure(apiTrafficLive)) // 前端实时流量订阅
 
@@ -428,9 +430,13 @@ func Start(tmplFS embed.FS) {
 		webPort := database.GetWebPort()
 		listenAddr := fmt.Sprintf(":%d", webPort)
 		activeServer := &http.Server{
-			Addr:     listenAddr,
-			Handler:  mux,
-			ErrorLog: log.New(&serverLogWriter{}, "", 0),
+			Addr:              listenAddr,
+			Handler:           middleware.SecurityHeaders(mux),
+			ErrorLog:          log.New(&serverLogWriter{}, "", 0),
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			IdleTimeout:       90 * time.Second,
+			MaxHeaderBytes:    1 << 20,
 		}
 
 		// 若证书就绪，则挂载 TLS 动态获取配置

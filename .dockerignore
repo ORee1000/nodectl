@@ -1,0 +1,9 @@
+*
+!.github/
+.github/*
+!.github/Dockerfile
+!.github/docker-entrypoint.sh
+!bin/
+bin/*
+!bin/nodectl-linux-amd64
+!bin/nodectl-linux-arm64

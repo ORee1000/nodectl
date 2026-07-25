@@ -31,13 +31,13 @@ const fixedWSPushIntervalSec = 2
 
 // Runtime Agent 运行时：调度采集与上报，管理信号与生命周期
 type Runtime struct {
-	cfg            *Config
-	collector      *Collector
-	reporter       *Reporter
-	updater        *Updater
-	logDedup       *LogDedup
-	cancel         context.CancelFunc
-	bootID         string
+	cfg       *Config
+	collector *Collector
+	reporter  *Reporter
+	updater   *Updater
+	logDedup  *LogDedup
+	cancel    context.CancelFunc
+	bootID    string
 
 	// 🆕 sing-box 管理模块
 	singboxMgr *singbox.Manager
@@ -345,6 +345,9 @@ func (rt *Runtime) fetchAndBuildProtocolConfig(ctx context.Context) (*singbox.Pr
 		return nil, fmt.Errorf("创建请求失败: %w", err)
 	}
 	req.Header.Set("User-Agent", "nodectl-agent/"+AgentVersion)
+	if rt.cfg.AgentToken != "" {
+		req.Header.Set("X-Nodectl-Agent-Token", rt.cfg.AgentToken)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {

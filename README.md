@@ -130,42 +130,67 @@ NodeCtl 采用 **Agent + 中心面板** 架构，为你的节点提供强大的�
 
 ## 🚀 三分钟快速部署
 
-写在前面：tunnel隧道原生支持IPV4和IPV6，如果你需要安装agnet，建议使用tunnel域名。（agnet会和安装singbox同步安装，并默认自动更新）
+写在前面：Tunnel 隧道原生支持 IPv4 和 IPv6。如果需要安装 Agent，建议使用
+Tunnel 域名（Agent 会随 Sing-box 安装脚本一并安装，并默认自动更新）。
 
-### 方式一：Docker Run（推荐）
+### 方式一：Docker Compose（推荐）
+
+```bash
+git clone https://github.com/ORee1000/nodectl.git
+cd nodectl
+cp .env.example .env
+docker compose up -d
+docker compose ps
+```
+
+项目自带的 `docker-compose.yml` 默认具备健康检查、日志轮转、只读根文件系统、
+PID 限制、Linux capabilities 收敛和优雅停止配置。服务仅绑定宿主机
+`127.0.0.1:7878`，持久化数据写入 `./data`；端口、数据目录、镜像和可信反向代理
+可在 `.env` 中调整。
+
+升级镜像不会删除数据：
+
+```bash
+docker compose pull
+docker compose up -d
+docker compose ps
+```
+
+### 方式二：Docker Run
 
 ```bash
 docker run -d \
   --name nodectl \
   --restart unless-stopped \
-  -p 7878:8080 \
+  --init \
+  --read-only \
+  --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
+  --security-opt no-new-privileges:true \
+  --cap-drop ALL \
+  --cap-add CHOWN \
+  --cap-add DAC_OVERRIDE \
+  --cap-add KILL \
+  --cap-add SETGID \
+  --cap-add SETUID \
+  --pids-limit 512 \
+  --stop-timeout 20 \
+  --log-opt max-size=10m \
+  --log-opt max-file=3 \
+  -p 127.0.0.1:7878:8080 \
+  -e NODECTL_ALLOW_INSECURE_HTTP=true \
   -v /opt/nodectl/data:/app/data \
-  ghcr.io/hobin66/nodectl:latest
+  ghcr.io/oree1000/nodectl:latest
 ```
 
-### 方式二：Docker Compose
-
-```yaml
-version: '3'
-services:
-  nodectl:
-    image: ghcr.io/hobin66/nodectl:latest
-    container_name: nodectl
-    restart: unless-stopped
-    ports:
-      - "7878:8080"
-    volumes:
-      - ./data:/app/data
-```
-
-运行 `docker-compose up -d` 即可启动！
+镜像入口会兼容修正旧版 root 数据卷的归属，然后以固定的非 root 用户
+`nodectl`（UID/GID 10001）运行主程序。
 
 ### 方式三：二进制脚本安装
 
 适合不想使用 Docker 的用户，支持 Debian/Ubuntu 和 Alpine 系统：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/hobin66/nodectl/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/ORee1000/nodectl/main/install.sh)
 ```
 
 安装完成后：
@@ -173,7 +198,17 @@ bash <(curl -fsSL https://raw.githubusercontent.com/hobin66/nodectl/main/install
 - 数据目录位于 `/opt/nodectl/data`
 - 可执行命令 `nt` 管理服务（如 `nt start`、`nt stop`、`nt status`）
 
-部署成功后访问 `http://你的IP:8080`，使用默认账号 `admin` / `admin` 登录。
+首次启动会在当前控制台打印随机管理员初始密码，不再提供通用默认密码。上述
+Docker 示例只把 HTTP 端口绑定到宿主机回环地址；请通过 SSH 端口转发访问
+`http://127.0.0.1:7878`，完成登录后配置 HTTPS 或 Cloudflare Tunnel。
+Docker 用户可通过 `docker compose logs nodectl` 查看首次启动输出。
+
+如果 TLS 在外部反向代理终止，请通过 `NODECTL_TRUSTED_PROXIES` 配置代理的
+IP/CIDR（多个值以逗号分隔），NodeCTL 才会信任 `X-Forwarded-*`。仅在已通过
+防火墙限制访问的兼容场景中才应启用 `NODECTL_ALLOW_INSECURE_HTTP=true`。
+
+从旧版本升级后，已有 Agent 暂时保持兼容连接。请在节点页面重新生成并执行一次
+安装脚本，为每个节点写入独立 Agent 密钥；新建节点会默认启用强认证。
 
 ---
 

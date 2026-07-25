@@ -80,14 +80,38 @@ func LoadDBConfig() DBConfig {
 
 // SaveDBConfig 保存数据库配置到文件
 func SaveDBConfig(cfg DBConfig) error {
-	if err := os.MkdirAll("data", os.ModePerm); err != nil {
+	if err := os.MkdirAll("data", 0700); err != nil {
 		return fmt.Errorf("创建 data 目录失败: %w", err)
 	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return fmt.Errorf("序列化配置失败: %w", err)
 	}
-	return os.WriteFile(dbConfigPath, data, 0600)
+	tmp, err := os.CreateTemp("data", ".dbconfig-*")
+	if err != nil {
+		return fmt.Errorf("创建数据库临时配置失败: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, dbConfigPath); err != nil {
+		return fmt.Errorf("原子替换数据库配置失败: %w", err)
+	}
+	return os.Chmod(dbConfigPath, 0600)
 }
 
 // GetCurrentDBConfig 获取当前数据库配置 (密码脱敏)
@@ -103,6 +127,7 @@ func GetCurrentDBConfig() DBConfig {
 type NodePool struct {
 	UUID                     string            `gorm:"primaryKey;column:uuid;type:varchar(36)" json:"uuid"`
 	InstallID                string            `gorm:"column:install_id;type:varchar(12);uniqueIndex" json:"install_id"`
+	AgentToken               string            `gorm:"column:agent_token;type:varchar(64);default:''" json:"-"`
 	Name                     string            `gorm:"column:name" json:"name"`
 	OfflineNotifyEnabled     bool              `gorm:"column:offline_notify_enabled;default:false" json:"offline_notify_enabled"`
 	OfflineNotifyGraceSec    int               `gorm:"column:offline_notify_grace_sec;default:180" json:"offline_notify_grace_sec"`
@@ -172,6 +197,9 @@ func (n *NodePool) BeforeCreate(tx *gorm.DB) (err error) {
 	}
 	if n.InstallID == "" {
 		n.InstallID = generateSecureRandomID(12)
+	}
+	if n.AgentToken == "" {
+		n.AgentToken = generateSecureRandomID(32)
 	}
 
 	// 从 SysConfig 读取所有协议的默认端口，写入 LinkPorts 作为该节点的初始端口配置
@@ -466,7 +494,7 @@ func autoMigrateAll(db *gorm.DB) error {
 
 // InitDB 初始化数据库连接并同步表结构
 func InitDB() {
-	if err := os.MkdirAll("data", os.ModePerm); err != nil {
+	if err := os.MkdirAll("data", 0700); err != nil {
 		logger.Log.Error("创建 data 目录失败", "err", err.Error())
 		panic("NodeCTL工作目录初始化失败")
 	}
@@ -635,15 +663,31 @@ func SwitchDatabase(cfg DBConfig) error {
 	if err != nil {
 		return fmt.Errorf("打开新数据库失败: %w", err)
 	}
+	newSQLDB, err := newDB.DB()
+	if err != nil {
+		return fmt.Errorf("获取新数据库连接失败: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = newSQLDB.Close()
+		}
+	}()
 
 	// 自动迁移表结构
 	if err := autoMigrateAll(newDB); err != nil {
 		return fmt.Errorf("新数据库表结构迁移失败: %w", err)
 	}
 
-	// 初始化默认配置 (使用新的DB)
+	// 先持久化配置，再切换运行时指针。保存失败时当前数据库完全不受影响。
+	if err := SaveDBConfig(cfg); err != nil {
+		return fmt.Errorf("保存配置文件失败: %w", err)
+	}
+
+	// 初始化默认配置 (使用新的 DB)
 	oldDB := DB
 	DB = newDB
+	committed = true
 
 	// 初始化默认系统设置到新数据库
 	initDefaultConfigs()
@@ -655,16 +699,17 @@ func SwitchDatabase(cfg DBConfig) error {
 		}
 	}
 
-	// 关闭旧连接
+	// 给切换前已经取得旧 *gorm.DB 的请求留出排空时间，避免立即关闭连接
+	// 导致正在执行的请求收到 "database is closed"。运行时切换本身由 dbMu
+	// 串行化；长期方案仍建议在维护窗口切换数据库。
 	if oldDB != nil {
 		if sqlDB, err := oldDB.DB(); err == nil {
-			sqlDB.Close()
+			time.AfterFunc(5*time.Minute, func() {
+				if err := sqlDB.Close(); err != nil {
+					logger.Log.Warn("关闭旧数据库连接失败", "err", err)
+				}
+			})
 		}
-	}
-
-	// 保存配置
-	if err := SaveDBConfig(cfg); err != nil {
-		return fmt.Errorf("保存配置文件失败: %w", err)
 	}
 
 	logger.Log.Info("数据库引擎已切换", "type", cfg.Type)
@@ -686,56 +731,50 @@ func MigrateToPostgres(pgCfg DBConfig) error {
 	if err != nil {
 		return fmt.Errorf("连接 PostgreSQL 目标数据库失败: %w", err)
 	}
+	dstSQLDB, err := dstDB.DB()
+	if err != nil {
+		return fmt.Errorf("获取 PostgreSQL 连接失败: %w", err)
+	}
+	defer dstSQLDB.Close()
 
 	// 3. 在目标数据库上创建表结构
 	if err := autoMigrateAll(dstDB); err != nil {
 		return fmt.Errorf("目标数据库表结构迁移失败: %w", err)
 	}
 
-	// 4. 逐表迁移数据
-	// 4.1 迁移 SysConfig
-	if err := migrateTable[SysConfig](srcDB, dstDB, "sys_config"); err != nil {
-		return fmt.Errorf("迁移 sys_config 失败: %w", err)
-	}
-
-	// 4.2 迁移 NodePool
-	if err := migrateTable[NodePool](srcDB, dstDB, "node_pool"); err != nil {
-		return fmt.Errorf("迁移 node_pool 失败: %w", err)
-	}
-
-	// 4.3 迁移 NodeTrafficStat (可能数据量大，分批处理)
-	if err := migrateTableBatched[NodeTrafficStat](srcDB, dstDB, "node_traffic_stats", 500); err != nil {
-		return fmt.Errorf("迁移 node_traffic_stats 失败: %w", err)
-	}
-
-	// 4.4 迁移 AirportSub
-	if err := migrateTable[AirportSub](srcDB, dstDB, "airport_subs"); err != nil {
-		return fmt.Errorf("迁移 airport_subs 失败: %w", err)
-	}
-
-	// 4.5 迁移 AirportNode
-	if err := migrateTable[AirportNode](srcDB, dstDB, "airport_nodes"); err != nil {
-		return fmt.Errorf("迁移 airport_nodes 失败: %w", err)
-	}
-
-	// 4.6 迁移 AirportSpeedTestHistory
-	if err := migrateTable[AirportSpeedTestHistory](srcDB, dstDB, "airport_speed_test_histories"); err != nil {
-		return fmt.Errorf("迁移 airport_speed_test_histories 失败: %w", err)
-	}
-
-	// 4.7 迁移 AirportSpeedTestResult
-	if err := migrateTable[AirportSpeedTestResult](srcDB, dstDB, "airport_speed_test_results"); err != nil {
-		return fmt.Errorf("迁移 airport_speed_test_results 失败: %w", err)
-	}
-
-	// 4.8 迁移 CustomNode
-	if err := migrateTable[CustomNode](srcDB, dstDB, "custom_nodes"); err != nil {
-		return fmt.Errorf("迁移 custom_nodes 失败: %w", err)
-	}
-
-	// 5. 修正 PostgreSQL 自增序列，避免后续写入撞主键
-	if err := syncNodeTrafficStatSequenceForDB(dstDB); err != nil {
-		return fmt.Errorf("同步 node_traffic_stats 序列失败: %w", err)
+	// 4. 所有清空与写入都处于同一个事务。任意表失败时回滚整个目标库，
+	// 避免留下部分迁移状态。
+	if err := dstDB.Transaction(func(tx *gorm.DB) error {
+		migrations := []struct {
+			name string
+			run  func() error
+		}{
+			{"sys_config", func() error { return migrateTable[SysConfig](srcDB, tx, "sys_config") }},
+			{"node_pool", func() error { return migrateTable[NodePool](srcDB, tx, "node_pool") }},
+			{"node_traffic_stats", func() error {
+				return migrateTableBatched[NodeTrafficStat](srcDB, tx, "node_traffic_stats", 500)
+			}},
+			{"airport_subs", func() error { return migrateTable[AirportSub](srcDB, tx, "airport_subs") }},
+			{"airport_nodes", func() error { return migrateTable[AirportNode](srcDB, tx, "airport_nodes") }},
+			{"airport_speed_test_histories", func() error {
+				return migrateTable[AirportSpeedTestHistory](srcDB, tx, "airport_speed_test_histories")
+			}},
+			{"airport_speed_test_results", func() error {
+				return migrateTable[AirportSpeedTestResult](srcDB, tx, "airport_speed_test_results")
+			}},
+			{"custom_nodes", func() error { return migrateTable[CustomNode](srcDB, tx, "custom_nodes") }},
+		}
+		for _, migration := range migrations {
+			if err := migration.run(); err != nil {
+				return fmt.Errorf("迁移 %s 失败: %w", migration.name, err)
+			}
+		}
+		if err := syncNodeTrafficStatSequenceForDB(tx); err != nil {
+			return fmt.Errorf("同步 node_traffic_stats 序列失败: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	logger.Log.Info("数据迁移完成: SQLite → PostgreSQL")
@@ -772,13 +811,14 @@ func migrateTable[T any](src, dst *gorm.DB, tableName string) error {
 	if err := src.Find(&records).Error; err != nil {
 		return fmt.Errorf("读取源表 %s 失败: %w", tableName, err)
 	}
+	// 先清空目标表
+	if err := dst.Exec("DELETE FROM " + tableName).Error; err != nil {
+		return fmt.Errorf("清空目标表 %s 失败: %w", tableName, err)
+	}
 	if len(records) == 0 {
-		logger.Log.Info("迁移跳过空表", "table", tableName)
+		logger.Log.Info("迁移空表完成", "table", tableName)
 		return nil
 	}
-
-	// 先清空目标表
-	dst.Exec("DELETE FROM " + tableName)
 
 	// 批量插入 (禁用钩子以避免 UUID 重新生成)
 	if err := dst.Session(&gorm.Session{SkipHooks: true}).CreateInBatches(records, 100).Error; err != nil {
@@ -792,10 +832,14 @@ func migrateTable[T any](src, dst *gorm.DB, tableName string) error {
 // migrateTableBatched 分批迁移大表
 func migrateTableBatched[T any](src, dst *gorm.DB, tableName string, batchSize int) error {
 	// 先清空目标表
-	dst.Exec("DELETE FROM " + tableName)
+	if err := dst.Exec("DELETE FROM " + tableName).Error; err != nil {
+		return fmt.Errorf("清空目标表 %s 失败: %w", tableName, err)
+	}
 
 	var total int64
-	src.Model(new(T)).Count(&total)
+	if err := src.Model(new(T)).Count(&total).Error; err != nil {
+		return fmt.Errorf("统计源表 %s 失败: %w", tableName, err)
+	}
 	if total == 0 {
 		logger.Log.Info("迁移跳过空表", "table", tableName)
 		return nil
@@ -926,6 +970,11 @@ func formatBytesHuman(bytes int64) string {
 
 // GetUnderlyingDB 获取底层 sql.DB 实例 (用于外部模块的 Ping、Stats 等)
 func GetUnderlyingDB() (*sql.DB, error) {
+	dbMu.RLock()
+	defer dbMu.RUnlock()
+	if DB == nil {
+		return nil, fmt.Errorf("数据库尚未初始化")
+	}
 	return DB.DB()
 }
 
