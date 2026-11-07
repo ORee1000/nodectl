@@ -489,6 +489,7 @@ func autoMigrateAll(db *gorm.DB) error {
 		&AirportSpeedTestHistory{},
 		&AirportSpeedTestResult{},
 		&CustomNode{},
+		&SubscriptionProfile{},
 	)
 }
 
@@ -611,8 +612,10 @@ func GetDBStatus() DBStatus {
 	status.RecordInfo["airport_nodes"] = count
 	DB.Model(&CustomNode{}).Count(&count)
 	status.RecordInfo["custom_nodes"] = count
+	DB.Model(&SubscriptionProfile{}).Count(&count)
+	status.RecordInfo["subscription_profiles"] = count
 
-	status.TableCount = 6
+	status.TableCount = len(status.RecordInfo)
 	return status
 }
 
@@ -763,6 +766,7 @@ func MigrateToPostgres(pgCfg DBConfig) error {
 				return migrateTable[AirportSpeedTestResult](srcDB, tx, "airport_speed_test_results")
 			}},
 			{"custom_nodes", func() error { return migrateTable[CustomNode](srcDB, tx, "custom_nodes") }},
+			{"subscription_profiles", func() error { return migrateTable[SubscriptionProfile](srcDB, tx, "subscription_profiles") }},
 		}
 		for _, migration := range migrations {
 			if err := migration.run(); err != nil {
@@ -932,6 +936,7 @@ func VacuumTable(tableName string) error {
 		"airport_speed_test_histories": true,
 		"airport_speed_test_results":   true,
 		"custom_nodes":                 true,
+		"subscription_profiles":        true,
 	}
 	if !allowed[tableName] {
 		return fmt.Errorf("不允许对表 %s 执行 VACUUM", tableName)

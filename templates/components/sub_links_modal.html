@@ -382,6 +382,16 @@
         background: #e5e5ea;
     }
 
+    .sub-profile-help { font-size:12px; color:#666; line-height:1.6; margin:12px 0; overflow-wrap:anywhere; }
+    .sub-profile-check { display:flex; align-items:center; gap:8px; margin-bottom:14px; font-size:13px; }
+    .sub-profile-buttons { display:flex; gap:8px; margin:10px 0; flex-wrap:wrap; }
+    .sub-profile-buttons[hidden] { display:none; }
+    .sub-profile-buttons .btn-sub-cancel { padding:8px 12px; }
+    .sub-landing-nodes { max-height:240px; overflow-y:auto; border:1px solid #e5e5ea; border-radius:8px; padding:10px; }
+    .sub-landing-nodes label { display:flex; gap:8px; align-items:flex-start; padding:7px 0; font-size:13px; overflow-wrap:anywhere; }
+    .sub-landing-nodes input { flex-shrink:0; margin-top:3px; }
+    .sub-left-col, .sub-right-col { box-sizing:border-box; min-width:0; }
+    #subProfileEditor:disabled { opacity:.65; }
     /* ================= 移动端适配 ================= */
     @media (max-width: 768px) {
         .sub-modal-card {
@@ -454,10 +464,37 @@
 
         <div class="sub-body no-scrollbar">
             <div class="sub-left-col no-scrollbar">
-                <label class="sub-section-label">📝 客户端显示的订阅名称</label>
+                <fieldset id="subProfileEditor" style="border:0;padding:0;margin:0;min-width:0">
+                <label class="sub-section-label" for="subProfileSelect">📂 选择订阅</label>
+                <select id="subProfileSelect" class="sub-name-input" style="margin-bottom:10px" onchange="switchSubProfile(this.value)"></select>
+                <button type="button" class="btn-sub-action btn-import" onclick="newSubProfile()">＋ 新建独立订阅</button>
+                <p id="subProfileNotice" class="sub-profile-help" role="status"></p>
+                <label class="sub-section-label" for="inputSubName">📝 客户端显示的订阅名称</label>
                 <input type="text" id="inputSubName" class="sub-name-input" placeholder="例如：我的私人节点池"
-                    oninput="saveCustomSubNameDebounced()">
+                    maxlength="100" oninput="markSubProfileDirty()">
 
+                <div id="subProfileOptions" hidden>
+                    <label class="sub-profile-check"><input id="subProfileEnabled" type="checkbox" onchange="markSubProfileDirty()"> 启用此订阅</label>
+                    <label class="sub-section-label" for="subLandingMode">落地节点范围</label>
+                    <select id="subLandingMode" class="sub-name-input" style="margin-bottom:10px" onchange="markSubProfileDirty(); renderSubLandingNodes()">
+                        <option value="selected">仅包含勾选的落地节点</option>
+                        <option value="all">全部落地节点（含以后新增）</option>
+                    </select>
+                    <div id="subLandingSelection">
+                        <input id="subLandingSearch" class="sub-name-input" style="margin-bottom:8px" placeholder="搜索节点名称或来源" aria-label="搜索落地节点" oninput="renderSubLandingNodes()">
+                        <div class="sub-profile-buttons"><button type="button" class="btn-sub-cancel" onclick="selectVisibleSubNodes(true)">全选搜索结果</button><button type="button" class="btn-sub-cancel" onclick="selectVisibleSubNodes(false)">清空搜索结果</button></div>
+                        <div id="subLandingNodes" class="sub-landing-nodes"></div>
+                    </div>
+                    <p id="subLandingCount" class="sub-profile-help" aria-live="polite"></p>
+                    <p class="sub-profile-help">直连 / 中转节点仍共用全局配置。这里的数量按落地节点计，同一节点的多个协议可能生成多条线路。</p>
+                </div>
+                <button type="button" class="btn-sub-action btn-copy" id="subProfileSave" onclick="saveSubProfile()">保存订阅</button>
+                <div id="subProfileActions" class="sub-profile-buttons" hidden>
+                    <button type="button" class="btn-sub-cancel" onclick="resetSubProfileToken()">重置链接</button>
+                    <button type="button" class="btn-sub-cancel" style="color:#d93025" onclick="deleteSubProfile()">删除订阅</button>
+                </div>
+                </fieldset>
+                <p id="subProfileStatus" class="sub-profile-help" role="status" aria-live="polite"></p>
                 <label class="sub-section-label">📌 选择订阅格式</label>
 
                 <div class="format-wrapper" id="wrap_clash">
@@ -521,12 +558,12 @@
         clash: {
             title: "😼 Clash Meta 订阅",
             desc: "推荐使用 <b>Clash Verge Rev</b> 或 <b>OpenClash</b>。<br>手机端可直接扫描下方二维码添加。",
-            getLink: () => `${currentBaseUrl}/sub/clash?token=${currentToken}`
+            getLink: () => `${currentBaseUrl}/sub/clash?token=${encodeURIComponent(currentToken)}`
         },
         v2ray: {
             title: "🌐 V2Ray / 通用 Base64",
             desc: "适用于 <b>v2rayN</b>、<b>v2rayNG</b>、<b>Shadowrocket</b> 等绝大多数基础代理工具。",
-            getLink: () => `${currentBaseUrl}/sub/v2ray?token=${currentToken}`
+            getLink: () => `${currentBaseUrl}/sub/v2ray?token=${encodeURIComponent(currentToken)}`
         }
     };
 
@@ -604,6 +641,10 @@
     // 核心渲染逻辑：生成一键导入按钮和二维码
     // 核心渲染逻辑：生成一键导入按钮和二维码
     function renderRightPanel(formatKey) {
+        if (!currentToken) {
+            document.getElementById('subRightContent').textContent = '请先保存并启用订阅，再复制链接。';
+            return;
+        }
         const data = subFormatData[formatKey];
         const link = data.getLink();
         const contentDiv = document.getElementById('subRightContent');
@@ -616,9 +657,8 @@
         if (formatKey === 'clash') {
             // 只有 Clash 模式下，加上 has-import 变成左右两列，并生成导入按钮
             gridClass = 'sub-actions-grid has-import';
-            const clashUrl = `clash://install-config?url=${encodeURIComponent(link)}&name=${encodeURIComponent(subName)}`;
             importBtnHtml = `
-                <a href="${clashUrl}" class="btn-sub-action btn-import">
+                <a id="subClashImport" class="btn-sub-action btn-import">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
                     导入 Clash
                 </a>
@@ -637,7 +677,7 @@
                 <div class="qr-box" id="qrCodeContainer"></div>
             </div>
 
-            <textarea class="sub-link-textarea" id="currentSubLinkText" readonly onclick="this.select()">${link}</textarea>
+            <textarea class="sub-link-textarea" id="currentSubLinkText" readonly onclick="this.select()"></textarea>
             
             <div class="${gridClass}">
                 <button class="btn-sub-action btn-copy" id="btnCopySubLink" onclick="copyCurrentSubLink()">
@@ -648,9 +688,16 @@
             </div>
         `;
 
+        document.getElementById('currentSubLinkText').value = link;
+        const importLink = document.getElementById('subClashImport');
+        if (importLink) importLink.href = `clash://install-config?url=${encodeURIComponent(link)}&name=${encodeURIComponent(subName)}`;
         const qrContainer = document.getElementById('qrCodeContainer');
         qrContainer.innerHTML = '';
-        new QRCode(qrContainer, {
+        if (typeof QRCode === 'undefined') {
+            qrContainer.textContent = '二维码暂不可用，可复制下方链接';
+            qrContainer.style.fontSize = '12px';
+            qrContainer.style.color = '#666';
+        } else new QRCode(qrContainer, {
             text: link,
             width: 140,
             height: 140,
@@ -660,78 +707,206 @@
         });
     }
 
-    // 打开弹窗并默认直接展开第一项 (修复动画带来的高度错误)
+    let subProfiles = [];
+    let subLandingNodes = [];
+    let selectedSubProfile = 'legacy';
+    let selectedLandingKeys = new Set();
+    let legacySubSettings = {};
+    let subProfileDirty = false;
+    let subProfileBusy = false;
+
+    function subProfileStatus(message, error = false) {
+        const el = document.getElementById('subProfileStatus');
+        el.textContent = message;
+        el.style.color = error ? '#d93025' : '#666';
+    }
+
+    async function subProfileRequest(url, options) {
+        const res = await fetch(url, options);
+        const result = await res.json();
+        if (!res.ok || result.status !== 'success') throw new Error(result.message || '请求失败，请稍后重试');
+        return result;
+    }
+
+    function setSubProfileBusy(busy) {
+        subProfileBusy = busy;
+        document.getElementById('subProfileEditor').disabled = busy;
+    }
+
+    function markSubProfileDirty() {
+        subProfileDirty = true;
+        subProfileStatus('有未保存的更改，请点击“保存订阅”。');
+    }
+
+    function renderSubProfileSelect() {
+        const select = document.getElementById('subProfileSelect');
+        select.replaceChildren(new Option('原有全量订阅（兼容）', 'legacy'));
+        for (const profile of subProfiles) select.add(new Option(profile.name + (profile.enabled ? '' : '（已停用）'), profile.id));
+        if (selectedSubProfile === 'new') select.add(new Option('新建订阅（未保存）', 'new'));
+        select.value = selectedSubProfile;
+    }
+
+    function loadSubProfileEditor() {
+        renderSubProfileSelect();
+        const legacy = selectedSubProfile === 'legacy';
+        const profile = subProfiles.find(p => p.id === selectedSubProfile);
+        document.getElementById('inputSubName').value = legacy ? (legacySubSettings.sub_custom_name || 'NodeCTL') : (profile?.name || '');
+        document.getElementById('subProfileOptions').hidden = legacy;
+        document.getElementById('subProfileActions').hidden = !profile;
+        document.getElementById('subProfileEnabled').checked = profile ? profile.enabled : true;
+        document.getElementById('subLandingMode').value = profile?.all_landing_nodes ? 'all' : 'selected';
+        document.getElementById('subLandingSearch').value = '';
+        selectedLandingKeys = new Set(profile?.landing_node_keys || []);
+        currentToken = legacy ? (legacySubSettings.sub_token || '') : (profile?.enabled ? profile.token : '');
+        document.getElementById('subProfileNotice').textContent = legacy
+            ? '原有链接包含全部可用节点；需要限制分享范围时，请新建独立订阅。'
+            : '每个订阅使用独立链接。修改节点范围后，客户端更新订阅即可生效。';
+        subProfileDirty = false;
+        subProfileStatus(profile && !profile.enabled ? '此订阅已停用，链接无法获取配置。' : '');
+        renderSubLandingNodes();
+        if (currentFormatKey) { renderRightPanel(currentFormatKey); adjustRightPanelPosition(); }
+    }
+
+    function switchSubProfile(id) {
+        if (subProfileBusy) return;
+        if (subProfileDirty && !confirm('切换订阅将放弃未保存的更改，继续吗？')) {
+            document.getElementById('subProfileSelect').value = selectedSubProfile;
+            return;
+        }
+        selectedSubProfile = id;
+        loadSubProfileEditor();
+    }
+
+    function newSubProfile() {
+        switchSubProfile('new');
+        if (selectedSubProfile === 'new') document.getElementById('inputSubName').focus();
+    }
+
+    function visibleSubLandingNodes() {
+        const query = document.getElementById('subLandingSearch').value.trim().toLowerCase();
+        return subLandingNodes.filter(n => (n.name + ' ' + n.source).toLowerCase().includes(query));
+    }
+
+    function renderSubLandingNodes() {
+        const all = document.getElementById('subLandingMode').value === 'all';
+        document.getElementById('subLandingSelection').hidden = all;
+        const list = document.getElementById('subLandingNodes');
+        list.replaceChildren();
+        for (const node of visibleSubLandingNodes()) {
+            const label = document.createElement('label');
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.checked = selectedLandingKeys.has(node.key);
+            checkbox.onchange = () => {
+                if (checkbox.checked) selectedLandingKeys.add(node.key); else selectedLandingKeys.delete(node.key);
+                markSubProfileDirty(); renderSubLandingNodes();
+            };
+            const text = document.createElement('span');
+            text.textContent = `${node.name} · ${node.source}${node.blocked ? '（已屏蔽，不下发）' : ''}`;
+            label.append(checkbox, text); list.append(label);
+        }
+        if (!list.childElementCount) list.textContent = subLandingNodes.length ? '没有匹配的节点' : '暂无落地节点，请先在节点管理中设置落地节点。';
+        const availableKeys = new Set(subLandingNodes.map(n => n.key));
+        const missing = [...selectedLandingKeys].filter(key => !availableKeys.has(key));
+        if (missing.length) {
+            const button = document.createElement('button');
+            button.type = 'button'; button.className = 'btn-sub-cancel';
+            button.textContent = `移除 ${missing.length} 个已不可用的选择`;
+            button.onclick = () => { missing.forEach(key => selectedLandingKeys.delete(key)); markSubProfileDirty(); renderSubLandingNodes(); };
+            list.append(button);
+        }
+        const selected = subLandingNodes.filter(n => selectedLandingKeys.has(n.key)).length;
+        document.getElementById('subLandingCount').textContent = all
+            ? `包含全部 ${subLandingNodes.length} 个落地节点，以后新增的也会加入。`
+            : `已选 ${selected} / ${subLandingNodes.length} 个落地节点${missing.length ? `，另有 ${missing.length} 个选择已不可用` : ''}。未勾选任何节点时，不下发落地节点。`;
+    }
+
+    function selectVisibleSubNodes(select) {
+        visibleSubLandingNodes().forEach(n => select ? selectedLandingKeys.add(n.key) : selectedLandingKeys.delete(n.key));
+        markSubProfileDirty(); renderSubLandingNodes();
+    }
+
+    async function saveSubProfile() {
+        if (subProfileBusy) return;
+        const name = document.getElementById('inputSubName').value.trim();
+        if (!name) { subProfileStatus('请输入订阅名称。', true); return; }
+        setSubProfileBusy(true);
+        try {
+            if (selectedSubProfile === 'legacy') {
+                await subProfileRequest('/api/update-settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({sub_custom_name:name})});
+                legacySubSettings.sub_custom_name = name;
+            } else {
+                const result = await subProfileRequest('/api/subscriptions', {
+                    method:selectedSubProfile === 'new' ? 'POST' : 'PUT', headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({id:selectedSubProfile, name, enabled:document.getElementById('subProfileEnabled').checked,
+                        all_landing_nodes:document.getElementById('subLandingMode').value === 'all', landing_node_keys:[...selectedLandingKeys]})
+                });
+                const index = subProfiles.findIndex(p => p.id === result.data.id);
+                if (index < 0) subProfiles.push(result.data); else subProfiles[index] = result.data;
+                selectedSubProfile = result.data.id;
+            }
+            loadSubProfileEditor(); subProfileStatus('订阅已保存。客户端更新订阅后生效。');
+        } catch (err) { subProfileStatus(err.message, true); }
+        finally { setSubProfileBusy(false); }
+    }
+
+    async function resetSubProfileToken() {
+        if (subProfileBusy || !confirm('重置后原链接立即失效，需要重新分享或导入新链接。继续吗？')) return;
+        setSubProfileBusy(true);
+        try {
+            const result = await subProfileRequest('/api/subscriptions/reset-token', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:selectedSubProfile})});
+            const profile = subProfiles.find(p => p.id === selectedSubProfile);
+            profile.token = result.token;
+            currentToken = profile.enabled ? result.token : '';
+            if (currentFormatKey) { renderRightPanel(currentFormatKey); adjustRightPanelPosition(); }
+            subProfileStatus('链接已重置，原链接已失效。' + (subProfileDirty ? '其他更改尚未保存。' : ''));
+        } catch (err) { subProfileStatus(err.message, true); }
+        finally { setSubProfileBusy(false); }
+    }
+
+    async function deleteSubProfile() {
+        if (subProfileBusy || !confirm('删除此订阅后，原链接立即失效。确定删除吗？')) return;
+        setSubProfileBusy(true);
+        try {
+            await subProfileRequest('/api/subscriptions?id='+encodeURIComponent(selectedSubProfile), {method:'DELETE'});
+            subProfiles = subProfiles.filter(p => p.id !== selectedSubProfile);
+            selectedSubProfile = subProfiles[0]?.id || 'legacy';
+            loadSubProfileEditor(); subProfileStatus('订阅已删除。');
+        } catch (err) { subProfileStatus(err.message, true); }
+        finally { setSubProfileBusy(false); }
+    }
+
     async function openSubLinksModal() {
-        // 先为卡片加上 has-content，让弹窗初始就呈现 800px 宽度
+        if (subProfileBusy) return;
         subModalCard.classList.add('has-content');
         document.getElementById('subRightCol').style.display = 'flex';
         subModal.classList.add('active');
         document.getElementById('subSaveIndicator').style.opacity = '0';
-
-        // 重置状态
-        currentFormatKey = null;
+        currentFormatKey = null; currentToken = '';
+        document.getElementById('subRightContent').textContent = '正在加载订阅…';
         document.querySelectorAll('.sub-format-card').forEach(c => c.classList.remove('active'));
-
+        subProfileStatus('正在加载订阅…'); setSubProfileBusy(true);
         try {
-            const res = await fetch('/api/get-settings');
-            const result = await res.json();
-
-            if (result.status === 'success') {
-                const data = result.data;
-                currentToken = data.sub_token || '';
-                currentBaseUrl = data.panel_url ? data.panel_url.replace(/\/+$/, '') : window.location.origin;
-                document.getElementById('inputSubName').value = data.sub_custom_name || 'NodeCTL';
-
-                // 数据加载完毕，直接选中 Clash 并渲染
-                const clashCard = document.querySelector('#wrap_clash .sub-format-card');
-                selectSubFormat('clash', clashCard);
-            }
-        } catch (e) { console.error("加载配置失败", e); }
-    }
-
-    // 关闭弹窗
-    function closeSubLinksModal() {
-        subModal.classList.remove('active');
-        // 延迟移除 has-content，避免关闭淡出时触发突兀的尺寸回缩
-        setTimeout(() => {
-            subModalCard.classList.remove('has-content');
-            currentFormatKey = null;
-        }, 300);
-    }
-
-    // 自动静默保存订阅名称 (防抖)，并自动刷新右侧的参数
-    let subNameSaveTimer = null;
-    function saveCustomSubNameDebounced() {
-        if (!document.getElementById('subLinksModal').classList.contains('active')) {
-            return;
+            const [settings, profiles] = await Promise.all([subProfileRequest('/api/get-settings'), subProfileRequest('/api/subscriptions')]);
+            legacySubSettings = settings.data;
+            currentBaseUrl = settings.data.panel_url ? settings.data.panel_url.replace(/\/+$/, '') : window.location.origin;
+            subProfiles = profiles.data; subLandingNodes = profiles.landing_nodes;
+            if (selectedSubProfile === 'new' || (selectedSubProfile !== 'legacy' && !subProfiles.some(p => p.id === selectedSubProfile))) selectedSubProfile = 'legacy';
+            loadSubProfileEditor();
+            selectSubFormat('clash', document.querySelector('#wrap_clash .sub-format-card'));
+            setSubProfileBusy(false);
+        } catch (err) {
+            subProfileBusy = false;
+            subProfileStatus('加载失败：'+err.message+'。请关闭后重试。', true);
+            document.getElementById('subRightContent').textContent = '订阅加载失败';
         }
+    }
 
-        clearTimeout(subNameSaveTimer);
-        const indicator = document.getElementById('subSaveIndicator');
-        indicator.innerHTML = '<span style="color:#888;">保存中...</span>';
-        indicator.style.opacity = '1';
-
-        subNameSaveTimer = setTimeout(async () => {
-            const newName = document.getElementById('inputSubName').value.trim() || 'NodeCTL';
-            try {
-                const res = await fetch('/api/update-settings', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ sub_custom_name: newName })
-                });
-                if (res.ok) {
-                    indicator.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"></path></svg> 名称已保存`;
-                    setTimeout(() => indicator.style.opacity = '0', 2000);
-
-                    if (currentFormatKey) {
-                        renderRightPanel(currentFormatKey);
-                        setTimeout(resizeSubLinkTextarea, 10);
-                    }
-                }
-            } catch (e) {
-                indicator.innerHTML = '<span style="color:#ff3b30;">保存失败</span>';
-            }
-        }, 600);
+    function closeSubLinksModal() {
+        if (subProfileBusy) return;
+        if (subProfileDirty && !confirm('关闭将放弃未保存的更改，继续吗？')) return;
+        subProfileDirty = false;
+        subModal.classList.remove('active');
     }
 
     // 一键复制链接逻辑

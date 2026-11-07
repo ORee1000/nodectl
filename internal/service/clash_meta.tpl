@@ -29,7 +29,7 @@ proxy-providers:
     type: http
     interval: {{.ProxiesInterval}}
     url: "{{.RelaySubURL}}"
-    path: ./proxy_providers/clash-node.yaml
+    path: ./proxy_providers/{{.SubscriptionCacheKey}}-clash-node.yaml
     health-check:
       enable: true
       url: https://www.gstatic.com/generate_204
@@ -38,7 +38,7 @@ proxy-providers:
     type: http
     interval: {{.ProxiesInterval}}
     url: "{{.ExitSubURL}}"
-    path: ./proxy_providers/exit.yaml
+    path: ./proxy_providers/{{.SubscriptionCacheKey}}-exit.yaml
     health-check:
       enable: true
       url: https://www.gstatic.com/generate_204

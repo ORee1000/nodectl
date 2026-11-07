@@ -25,6 +25,11 @@ type ClashProvider struct {
 // GenerateRawNodesYAML 动态生成指定路由类型的节点 YAML
 // routingType: 1=直连, 2=落地
 func GenerateRawNodesYAML(routingType int, useFlag bool) (string, error) {
+	return GenerateRawNodesYAMLForSubscription(routingType, useFlag, nil)
+}
+
+func GenerateRawNodesYAMLForSubscription(routingType int, useFlag bool, profile *database.SubscriptionProfile) (string, error) {
+	scope := newSubscriptionScope(profile)
 	var nodes []database.NodePool
 	// 按照 SortIndex 排序获取节点
 	if err := database.DB.Where("routing_type = ? AND is_blocked = ?", routingType, false).
@@ -48,6 +53,9 @@ func GenerateRawNodesYAML(routingType int, useFlag bool) (string, error) {
 
 	for i := range nodes {
 		node := &nodes[i]
+		if !scope.allows(node.RoutingType, "node:"+node.UUID) {
+			continue
+		}
 		if shouldExcludeNodeByTrafficThreshold(node) {
 			continue
 		}
@@ -117,6 +125,9 @@ func GenerateRawNodesYAML(routingType int, useFlag bool) (string, error) {
 		Order("sub_id, original_index ASC").Find(&airportNodes).Error; err == nil {
 
 		for _, anode := range airportNodes {
+			if !scope.allows(anode.RoutingType, AirportSubscriptionKey(anode)) {
+				continue
+			}
 			// 解析机场原始链接 (vmess://, ss:// 等) 为 Clash 对象
 			// 注意：这里不需要 suffix，直接使用原始链接解析
 			proxyNode := ParseLinkToClashNode(anode.Link, "")
@@ -138,6 +149,9 @@ func GenerateRawNodesYAML(routingType int, useFlag bool) (string, error) {
 		Order("created_at ASC").Find(&customNodes).Error; err == nil {
 
 		for _, cnode := range customNodes {
+			if !scope.allows(cnode.RoutingType, "custom:"+cnode.ID) {
+				continue
+			}
 			proxyNode := ParseLinkToClashNode(cnode.Link, "")
 			if proxyNode != nil {
 				// 使用链接中解析出的原始名称（不做转化）
@@ -205,6 +219,11 @@ func contains(slice []string, item string) bool {
 
 // GenerateV2RaySubBase64 生成通用 Base64 订阅 (包含直连和落地)
 func GenerateV2RaySubBase64(useFlag bool) (string, error) {
+	return GenerateV2RaySubBase64ForSubscription(useFlag, nil)
+}
+
+func GenerateV2RaySubBase64ForSubscription(useFlag bool, profile *database.SubscriptionProfile) (string, error) {
+	scope := newSubscriptionScope(profile)
 	var nodes []database.NodePool
 	// 取出直连(1)和落地(2)的节点，排除被屏蔽的
 	if err := database.DB.Where("routing_type IN ? AND is_blocked = ?", []int{1, 2}, false).
@@ -228,6 +247,9 @@ func GenerateV2RaySubBase64(useFlag bool) (string, error) {
 
 	for i := range nodes {
 		node := &nodes[i]
+		if !scope.allows(node.RoutingType, "node:"+node.UUID) {
+			continue
+		}
 		if shouldExcludeNodeByTrafficThreshold(node) {
 			continue
 		}
@@ -308,6 +330,9 @@ func GenerateV2RaySubBase64(useFlag bool) (string, error) {
 		Order("sub_id, original_index ASC").Find(&airportNodes).Error; err == nil {
 
 		for _, anode := range airportNodes {
+			if !scope.allows(anode.RoutingType, AirportSubscriptionKey(anode)) {
+				continue
+			}
 			// 核心：使用重命名引擎，确保订阅出来的链接名称与数据库中一致
 			// RenameNodeLink 函数位于 links.go 中
 			finalLink := RenameNodeLink(anode.Link, anode.Name)
@@ -323,6 +348,9 @@ func GenerateV2RaySubBase64(useFlag bool) (string, error) {
 		Order("created_at ASC").Find(&customNodes).Error; err == nil {
 
 		for _, cnode := range customNodes {
+			if !scope.allows(cnode.RoutingType, "custom:"+cnode.ID) {
+				continue
+			}
 			// 直接使用原始链接，保留链接中的名称
 			lines = append(lines, strings.TrimSpace(cnode.Link))
 		}

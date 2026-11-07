@@ -2,6 +2,7 @@ package service
 
 import (
 	"bytes"
+	"crypto/sha256"
 	_ "embed"
 	"encoding/json"
 	"errors"
@@ -121,6 +122,7 @@ type ClashTemplateData struct {
 	ExitSubURL              string
 	BaseURL                 string
 	Token                   string
+	SubscriptionCacheKey    string
 	ActiveModules           []ClashModuleDef
 	GlobalDirectIcon        string
 	CustomProxies           []CustomProxyRule
@@ -209,6 +211,7 @@ func RenderClashConfig(relayURL, exitURL, baseURL, token string) (string, error)
 		ActiveModules:           finalActiveMods,
 		BaseURL:                 baseURL,
 		Token:                   token,
+		SubscriptionCacheKey:    fmt.Sprintf("%x", sha256.Sum256([]byte(baseURL+"\x00"+token)))[:16],
 		GlobalDirectIcon:        getEmojiURL(GetCustomDirectIcon()),
 		CustomProxies:           validCustomProxies, // 替换为过滤后的有效分组
 		NameserverPolicyRuleSet: dnsPolicyStr,
