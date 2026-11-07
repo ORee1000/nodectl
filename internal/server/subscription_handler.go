@@ -1,7 +1,9 @@
 package server
 
 import (
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -11,15 +13,37 @@ import (
 	"nodectl/internal/database"
 	"nodectl/internal/logger"
 	"nodectl/internal/service"
+
+	"gorm.io/gorm"
 )
 
 // ------------------- [订阅与分流规则 API] -------------------
 
-func verifySubToken(r *http.Request) bool {
+// resolveSubToken resolves only the bearer token; request parameters cannot widen its scope.
+// A nil profile is the legacy global subscription.
+func resolveSubToken(r *http.Request) (*database.SubscriptionProfile, bool) {
 	token := r.URL.Query().Get("token")
+	if token == "" {
+		return nil, false
+	}
+	var profile database.SubscriptionProfile
+	err := database.DB.Where("token = ?", token).First(&profile).Error
+	if err == nil {
+		return &profile, profile.Enabled
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false
+	}
 	var config database.SysConfig
-	database.DB.Where("key = ?", "sub_token").First(&config)
-	return token != "" && token == config.Value
+	if database.DB.Where("key = ?", "sub_token").First(&config).Error != nil {
+		return nil, false
+	}
+	return nil, subtle.ConstantTimeCompare([]byte(token), []byte(config.Value)) == 1
+}
+
+func verifySubToken(r *http.Request) bool {
+	_, ok := resolveSubToken(r)
+	return ok
 }
 
 func getBaseURL(r *http.Request) string {
@@ -36,10 +60,12 @@ func getBaseURL(r *http.Request) string {
 }
 
 func apiSubClash(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	clientIP := getClientIP(r)
 	reqPath := r.URL.Path
 
-	if !verifySubToken(r) {
+	profile, valid := resolveSubToken(r)
+	if !valid {
 		logger.Log.Warn("Clash 订阅请求: Token 验证失败", "ip", clientIP, "path", reqPath)
 		http.Error(w, "Invalid Token", http.StatusForbidden)
 		return
@@ -48,10 +74,10 @@ func apiSubClash(w http.ResponseWriter, r *http.Request) {
 	baseURL := getBaseURL(r)
 	token := r.URL.Query().Get("token")
 
-	relayURL := fmt.Sprintf("%s/sub/raw/2?token=%s", baseURL, token)
-	exitURL := fmt.Sprintf("%s/sub/raw/1?token=%s", baseURL, token)
+	relayURL := fmt.Sprintf("%s/sub/raw/2?token=%s", baseURL, url.QueryEscape(token))
+	exitURL := fmt.Sprintf("%s/sub/raw/1?token=%s", baseURL, url.QueryEscape(token))
 
-	yamlContent, err := service.RenderClashConfig(relayURL, exitURL, baseURL, token)
+	yamlContent, err := service.RenderClashConfig(relayURL, exitURL, baseURL, url.QueryEscape(token))
 	if err != nil {
 		logger.Log.Error("生成 Clash 订阅模板失败", "error", err, "ip", clientIP, "path", reqPath)
 		http.Error(w, "模板生成失败", http.StatusInternalServerError)
@@ -61,6 +87,9 @@ func apiSubClash(w http.ResponseWriter, r *http.Request) {
 	var nameConfig database.SysConfig
 	database.DB.Where("key = ?", "sub_custom_name").First(&nameConfig)
 	subName := nameConfig.Value
+	if profile != nil {
+		subName = profile.Name
+	}
 	if subName == "" {
 		subName = "NodeCTL"
 	}
@@ -69,7 +98,7 @@ func apiSubClash(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
 	w.Header().Set("profile-title", subName)
 
-	if userinfo := service.GetSubscriptionUserinfo(); userinfo != "" {
+	if userinfo := service.GetSubscriptionUserinfoForProfile(profile); userinfo != "" {
 		w.Header().Set("Subscription-Userinfo", userinfo)
 	}
 
@@ -80,10 +109,12 @@ func apiSubClash(w http.ResponseWriter, r *http.Request) {
 }
 
 func apiSubV2ray(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	clientIP := getClientIP(r)
 	reqPath := r.URL.Path
 
-	if !verifySubToken(r) {
+	profile, valid := resolveSubToken(r)
+	if !valid {
 		logger.Log.Warn("V2Ray 订阅请求: Token 验证失败", "ip", clientIP, "path", reqPath)
 		http.Error(w, "Invalid Token", http.StatusForbidden)
 		return
@@ -93,7 +124,7 @@ func apiSubV2ray(w http.ResponseWriter, r *http.Request) {
 	database.DB.Where("key = ?", "pref_use_emoji_flag").First(&flagConfig)
 	useFlag := flagConfig.Value != "false"
 
-	b64Content, err := service.GenerateV2RaySubBase64(useFlag)
+	b64Content, err := service.GenerateV2RaySubBase64ForSubscription(useFlag, profile)
 	if err != nil {
 		logger.Log.Error("生成 V2Ray Base64 订阅失败", "error", err, "ip", clientIP, "path", reqPath)
 		http.Error(w, "订阅生成失败", http.StatusInternalServerError)
@@ -103,6 +134,9 @@ func apiSubV2ray(w http.ResponseWriter, r *http.Request) {
 	var nameConfig database.SysConfig
 	database.DB.Where("key = ?", "sub_custom_name").First(&nameConfig)
 	subName := nameConfig.Value
+	if profile != nil {
+		subName = profile.Name
+	}
 	if subName == "" {
 		subName = "NodeCTL"
 	}
@@ -111,7 +145,7 @@ func apiSubV2ray(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("profile-title", subName)
 
-	if userinfo := service.GetSubscriptionUserinfo(); userinfo != "" {
+	if userinfo := service.GetSubscriptionUserinfoForProfile(profile); userinfo != "" {
 		w.Header().Set("Subscription-Userinfo", userinfo)
 	}
 
@@ -122,10 +156,12 @@ func apiSubV2ray(w http.ResponseWriter, r *http.Request) {
 }
 
 func apiSubRaw(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	clientIP := getClientIP(r)
 	reqPath := r.URL.Path
 
-	if !verifySubToken(r) {
+	profile, valid := resolveSubToken(r)
+	if !valid {
 		logger.Log.Warn("Raw 节点列表请求: Token 验证失败", "ip", clientIP, "path", reqPath)
 		http.Error(w, "Invalid Token", http.StatusForbidden)
 		return
@@ -142,7 +178,7 @@ func apiSubRaw(w http.ResponseWriter, r *http.Request) {
 	database.DB.Where("key = ?", "pref_use_emoji_flag").First(&flagConfig)
 	useFlag := flagConfig.Value != "false"
 
-	yamlContent, err := service.GenerateRawNodesYAML(routingType, useFlag)
+	yamlContent, err := service.GenerateRawNodesYAMLForSubscription(routingType, useFlag, profile)
 	if err != nil {
 		logger.Log.Error("生成 Raw 节点列表失败", "error", err, "routing_type", routingType, "ip", clientIP, "path", reqPath)
 		http.Error(w, "节点生成失败", http.StatusInternalServerError)

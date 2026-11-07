@@ -270,6 +270,8 @@ func Start(tmplFS embed.FS) {
 	// 基础与设置
 	mux.HandleFunc("/api/change-password", withAuthAndSecure(apiChangePassword))
 	mux.HandleFunc("/api/reset-jwt", withAuthAndSecure(apiResetJWT))
+	mux.HandleFunc("/api/subscriptions", withAuthAndSecure(apiSubscriptions))
+	mux.HandleFunc("/api/subscriptions/reset-token", withAuthAndSecure(apiResetSubscriptionToken))
 	mux.HandleFunc("/api/get-settings", withAuthAndSecure(apiGetSettings))
 	mux.HandleFunc("/api/update-settings", withAuthAndSecure(apiUpdateSettings))
 
